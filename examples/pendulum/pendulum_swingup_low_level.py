@@ -2,7 +2,7 @@
 Differentiable MPC: tuning cost weights via gradient descent
 ============================================================
 
-This example shows how to use ``bpmpc_jax`` to tune the *internal* cost
+This example shows how to use ``bpmpc`` to tune the *internal* cost
 weights of a Model Predictive Controller end-to-end, so that the resulting
 *closed-loop* behaviour is optimal with respect to a separate task cost.
 
@@ -36,11 +36,11 @@ from scipy.linalg import solve_discrete_are
 
 jax.config.update("jax_enable_x64", True)
 
-from bpmpc_jax.variable import Variable
-from bpmpc_jax.mpc import MPCProblem, Cost
-from bpmpc_jax.mpc.helpers import build_state_tracking, nonlinear_dynamics, box_bounds
-from bpmpc_jax.closed_loop import ClosedLoop, RunLogger
-from bpmpc_jax.env import CartPendulum
+from bpmpc.variable import Variable
+from bpmpc.mpc import MPCProblem, Cost
+from bpmpc.mpc.helpers import build_state_tracking, nonlinear_dynamics, box_bounds
+from bpmpc.closed_loop import ClosedLoop, RunLogger
+from bpmpc.env import CartPendulum
 
 from jaxsparrow import setup_sparse_solver
 
@@ -191,17 +191,11 @@ mpc   = setup_swingup_mpc(plant)
 # ============================================================================
 # 3. Closed-loop simulation
 # ============================================================================
-def simulate_closed_loop(p):
-    """Run the closed-loop MPC simulation for a given parameter ``p``.
-
-    Returns a dict with:
-      * ``cost`` : scalar task cost (objective for the outer optimiser).
-      * ``xs``   : (HORIZON_SIM, NX) state trajectory.
-      * ``us``   : (HORIZON_SIM, NU) input trajectory.
-    """
+def get_closed_loop():
+    """Constructs a ClosedLoop object capable of running the simulation."""
 
     def init(inputs, n_steps):
-        prep = mpc.prepare({"p": p})
+        prep = mpc.prepare({"p": inputs["p"]})
 
         # Crude initial guess for the very first SQP linearisation point.
         x_seed = jnp.tile(inputs["x0"], (HORIZON_MPC, 1))
@@ -211,29 +205,39 @@ def simulate_closed_loop(p):
         # before the closed loop starts.
         sol0 = mpc.solve_with_prepared(
             prep,
-            {"x0": inputs["x0"], "x_nom": x_seed, "u_nom": u_seed, "p": p},
+            {"x0": inputs["x0"], "x_nom": x_seed, "u_nom": u_seed, "p": inputs["p"]},
             warmstart=None,
         )
         x_nom = sol0["x"]["x"].reshape((HORIZON_MPC, NX))
         u_nom = sol0["x"]["u"].reshape((HORIZON_MPC, NU))
 
-        return {"x": inputs["x0"], "x_nom": x_nom, "u_nom": u_nom, "prepared": prep}
+        # Explicitly separate dynamic state from static constants
+        initial_state = {
+            "x": inputs["x0"], 
+            "x_nom": x_nom, 
+            "u_nom": u_nom
+        }
+        constants = {
+            "prepared": prep,
+            "p": inputs["p"]
+        }
+        
+        return initial_state, constants
 
-    def step(carry, k):
+    def step(state, k, constants):
         # A. Solve the MPC (one SQP iteration).
         sol = mpc.solve_with_prepared(
-            carry["prepared"],
-            {"x0": carry["x"], "x_nom": carry["x_nom"],
-             "u_nom": carry["u_nom"], "p": p},
+            constants["prepared"],
+            {"x0": state["x"], "x_nom": state["x_nom"],
+             "u_nom": state["u_nom"], "p": constants["p"]},
             warmstart=None,
         )
         u = sol["x"]["u0"]
 
         # B. Step the true environment.
-        x_next = plant.step(carry["x"], u)
+        x_next = plant.step(state["x"], u)
 
         # C. Build the linearisation trajectory for the NEXT step.
-        # ---- Original (kept for reference) ----
         # next_x_nom = sol["x"]["x"].reshape((HORIZON_MPC, NX))
         # next_u_nom = sol["x"]["u"].reshape((HORIZON_MPC, NU))
         x_sol = sol["x"]["x"].reshape((HORIZON_MPC, NX))
@@ -241,15 +245,18 @@ def simulate_closed_loop(p):
         next_u_nom = jnp.concatenate([u_sol[1:], u_sol[-1:]], axis=0)
         next_x_nom = x_sol.at[0].set(x_next)
 
-        new_carry = {
+        new_state = {
             "x":        x_next,
             "x_nom":    next_x_nom,
             "u_nom":    next_u_nom,
-            "prepared": carry["prepared"],
         }
-        return new_carry, {"x": carry["x"], "u": u}
+        log = {
+            "x": state["x"], 
+            "u": u
+        }
+        return new_state, log
 
-    def finalize(final_carry, logs):
+    def finalize(final_state, logs, constants):
         xs, us = logs["x"], logs["u"]
 
         # Quadratic task cost.
@@ -263,16 +270,20 @@ def simulate_closed_loop(p):
                           jnp.maximum(0.0, X_MIN_TASK - xs), 0.0)
         viol  = jnp.sum(upper) + jnp.sum(lower)
 
-        return {"cost": track + VIOLATION_W * viol, "xs": xs, "us": us}
+        objective = track + VIOLATION_W * viol
+        metrics = {
+            "tracking_cost": track, 
+            "constraint_violation": viol
+        }
 
-    sim = ClosedLoop(init=init, step=step,
-                     n_steps=HORIZON_SIM, finalize=finalize)
-    return sim.run({"x0": X0_INIT})
+        return objective, metrics
 
-
-def compute_trajectory_loss(theta_tune):
-    """Scalar objective for the outer optimiser."""
-    return simulate_closed_loop(theta_tune["p"])["cost"]
+    return ClosedLoop(
+        init=init, 
+        step=step,
+        n_steps=HORIZON_SIM, 
+        finalize=finalize
+    )
 
 
 # ============================================================================
@@ -303,12 +314,12 @@ def dare_init_theta(plant):
 # ============================================================================
 # 5. Optax tuning loop
 # ============================================================================
-def tune_mpc_weights(theta_initial):
+def tune_mpc_weights(p_initial):
     """Tune MPC parameters by SGD on the closed-loop task cost.
 
     Parameters
     ----------
-    theta_initial : dict
+    p_initial : dict
         Pytree of starting parameters, e.g. ``{"p": jnp.ndarray}``.
 
     Returns
@@ -316,42 +327,50 @@ def tune_mpc_weights(theta_initial):
     theta_final : dict
         Pytree of optimised parameters in the same structure as the input.
     """
-    theta = theta_initial
+    p = p_initial
 
     # Robbins-Monro-style decaying step size.
     def alpha_schedule(k):
         return RHO * jnp.log(k + 2) / (k + 1) ** ETA
 
     optimizer = optax.sgd(learning_rate=alpha_schedule)
-    opt_state = optimizer.init(theta)
+    opt_state = optimizer.init(p)
 
+    # form closed-loop
+    closed_loop = get_closed_loop()
+
+    # define the closed-loop loss (initial condition is fixed)
+    def compute_trajectory_loss(p):
+        return closed_loop.run({"x0": X0_INIT, "p":p}).objective
+
+    # get gradient and compile
     backward = jax.jit(jax.value_and_grad(compute_trajectory_loss))
 
-    def train_step(theta, state):
-        loss_val, grads = backward(theta)
+    def train_step(p, state):
+        loss_val, grads = backward(p)
 
         # clip the gradient if needed
-        n_grad = jnp.linalg.norm(grads["p"])
+        n_grad = jnp.linalg.norm(grads)
         if n_grad > CLIP:
-            grads["p"] = grads["p"] / n_grad * CLIP
+            grads = grads / n_grad * CLIP
 
         updates, new_state = optimizer.update(grads, state)
-        return optax.apply_updates(theta, updates), new_state, loss_val
+        return optax.apply_updates(p, updates), new_state, loss_val
 
     print("Starting differentiable MPC tuning via gradient descent...")
-    print(f"  Initial p: {np.asarray(theta['p'])}\n")
+    print(f"  Initial p: {np.asarray(p)}\n")
 
     logger = RunLogger()
     for epoch in range(N_ITER):
         t0 = time.time()
-        theta, opt_state, loss_val = train_step(theta, opt_state)
+        p, opt_state, loss_val = train_step(p, opt_state)
         dt = time.time() - t0
         logger.log(Epoch=f"{epoch:02d}",
                    TaskCost=f"{loss_val:.2f}",
                    Time=f"{dt:.3f}s")
 
-    print(f"\n  Final p: {np.asarray(theta['p'])}") #type: ignore
-    return theta
+    print(f"\n  Final p: {np.asarray(p)}")
+    return p
 
 
 # ============================================================================
@@ -364,9 +383,9 @@ def plot_before_after(traj_before, traj_after, savepath=None):
     fig, axes = plt.subplots(3, 1, figsize=(8.5, 7.5), sharex=True)
 
     # 1. Cart position
-    axes[0].plot(t, traj_before["xs"][:, 0],
+    axes[0].plot(t, traj_before["x"][:, 0],
                  linestyle="--", color="tab:gray",  label="before")
-    axes[0].plot(t, traj_after["xs"][:, 0],
+    axes[0].plot(t, traj_after["x"][:, 0],
                  color="tab:blue", label="after")
     axes[0].axhline(0.0, color="k", linewidth=0.5, linestyle=":")
     axes[0].set_ylabel("Cart position [m]")
@@ -374,9 +393,9 @@ def plot_before_after(traj_before, traj_after, savepath=None):
     axes[0].legend(loc="best")
 
     # 2. Pendulum angle (target = 0; hanging down = -pi).
-    axes[1].plot(t, traj_before["xs"][:, 2],
+    axes[1].plot(t, traj_before["x"][:, 2],
                  linestyle="--", color="tab:gray", label="before")
-    axes[1].plot(t, traj_after["xs"][:, 2],
+    axes[1].plot(t, traj_after["x"][:, 2],
                  color="tab:orange", label="after")
     axes[1].axhline( 0.0,    color="g", linewidth=0.6, linestyle=":", label="upright")
     axes[1].axhline(-np.pi,  color="r", linewidth=0.6, linestyle=":", label="hanging")
@@ -385,9 +404,9 @@ def plot_before_after(traj_before, traj_after, savepath=None):
     axes[1].legend(loc="best", ncol=2)
 
     # 3. Control input
-    axes[2].plot(t, traj_before["us"][:, 0],
+    axes[2].plot(t, traj_before["u"][:, 0],
                  linestyle="--", color="tab:gray",  label="before")
-    axes[2].plot(t, traj_after["us"][:, 0],
+    axes[2].plot(t, traj_after["u"][:, 0],
                  color="tab:green", label="after")
     axes[2].axhline(float(U_MAX_MPC[0]), color="r", linewidth=0.6, linestyle=":")
     axes[2].axhline(float(U_MIN_MPC[0]), color="r", linewidth=0.6, linestyle=":")
@@ -410,24 +429,24 @@ def plot_before_after(traj_before, traj_after, savepath=None):
 # ============================================================================
 def main():
     # JIT once; reused for both rollouts.
-    rollout = jax.jit(simulate_closed_loop)
+    rollout = jax.jit(lambda p_ : get_closed_loop().run({"x0":X0_INIT, "p":p_}))
 
     # 1. Roll out with the initial DARE-based parameters.
-    theta_init = {"p": dare_init_theta(plant)}
+    p_init = dare_init_theta(plant)
     print("Rolling out with initial parameters...")
-    traj_before = rollout(theta_init["p"])
-    print(f"  Initial task cost: {float(traj_before['cost']):.2f}\n")
+    traj_before = rollout(p_init)
+    print(f"  Initial task cost: {float(traj_before.objective):.2f}\n")
 
     # 2. Tune.
-    theta_final = tune_mpc_weights(theta_init)
+    p_final = tune_mpc_weights(p_init)
 
     # 3. Roll out with the optimised parameters.
     print("\nRolling out with optimised parameters...")
-    traj_after = rollout(theta_final["p"]) #type: ignore
-    print(f"  Final task cost: {float(traj_after['cost']):.2f}\n")
+    traj_after = rollout(p_final)
+    print(f"  Final task cost: {float(traj_after.objective):.2f}\n")
 
     # 4. Compare.
-    plot_before_after(traj_before, traj_after)
+    plot_before_after(traj_before.trajectory, traj_after.trajectory)
 
 
 if __name__ == "__main__":

@@ -12,8 +12,8 @@ import numpy as np
 import jax.numpy as jnp
 import pytest
 
-from bpmpc_jax.variable import Variable
-from bpmpc_jax.mpc.helpers import (
+from bpmpc.variable import Variable
+from bpmpc.mpc.helpers import (
     lti_dynamics, ltv_dynamics, nonlinear_dynamics,
     box_bounds,
     state_tracking_cost, output_tracking_cost,
@@ -22,7 +22,7 @@ from bpmpc_jax.mpc.helpers import (
     build_box_lhs, build_box_rhs,
     build_state_tracking, build_output_tracking,
 )
-from bpmpc_jax.mpc import SlackSpec
+from bpmpc.mpc import SlackSpec
 
 
 # ======================================================================
@@ -164,7 +164,7 @@ class TestLTVDynamics:
 class TestNonlinearDynamics:
 
     def setup_method(self):
-        from bpmpc_jax.dynamics import Dynamics
+        from bpmpc.dynamics import Dynamics
         
         def nl_step(x, u, p):
             # A distinct nonlinear dynamics function
@@ -597,7 +597,7 @@ class TestHelperIntegration:
     """Verify helpers compose into a valid MPCProblem."""
 
     def test_full_assembly(self):
-        from bpmpc_jax.mpc import MPCProblem
+        from bpmpc.mpc import MPCProblem
 
         v_x0 = Variable("x0", (NX,))
 
@@ -631,7 +631,7 @@ class TestHelperIntegration:
 
     def test_slack_integration_solve(self):
         """Verifies solving an initially infeasible problem with explicitly separated state and input bounds."""
-        from bpmpc_jax.mpc import MPCProblem
+        from bpmpc.mpc import MPCProblem
         from jaxsparrow import setup_dense_solver
 
         jax.config.update("jax_enable_x64", True)

@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from bpmpc_jax.sys_id import extract_features, RLS
+from bpmpc.sys_id import extract_features, RLS
 
 jax.config.update("jax_enable_x64", True)
 

@@ -3,11 +3,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from bpmpc_jax.mpc import Cost, Constraint, MPCProblem
-from bpmpc_jax.mpc.helpers import lti_dynamics, box_bounds
-from bpmpc_jax.variable import Variable
-from bpmpc_jax.dynamics import Dynamics
-from bpmpc_jax.closed_loop import ClosedLoop
+from bpmpc.mpc import Cost, Constraint, MPCProblem
+from bpmpc.mpc.helpers import lti_dynamics, box_bounds
+from bpmpc.variable import Variable
+from bpmpc.dynamics import Dynamics
+from bpmpc.closed_loop import ClosedLoop
 from jaxsparrow import setup_dense_solver
 
 jax.config.update("jax_enable_x64", True)
@@ -121,21 +121,21 @@ def test_closed_loop_lqr_equivalence():
 
     def init(inputs, n_steps):
         prep = mpc.prepare({"A": A_val, "B": B_val, "Q": Q_val, "R": R_val})
-        return {"x": inputs["x0"], "prepared": prep, "cost_sum": 0.0}
+        return {"x": inputs["x0"], "cost_sum": 0.0}, {"prepared": prep}
 
-    def step(carry, k):
-        fast_v = {"x0": carry["x"], "A": A_val}
-        sol = mpc.solve_with_prepared(carry["prepared"], fast_v, None)
+    def step(state, k, constants):
+        fast_v = {"x0": state["x"], "A": A_val}
+        sol = mpc.solve_with_prepared(constants["prepared"], fast_v, None)
         
         u = sol["x"]["u0"]
-        x_next = plant.step(carry["x"], u, {}, {})
+        x_next = plant.step(state["x"], u, {}, {})
         
-        step_cost = carry["x"] @ Q_val @ carry["x"] + u @ R_val @ u
-        new_carry = {"x": x_next, "prepared": carry["prepared"], "cost_sum": carry["cost_sum"] + step_cost}
-        return new_carry, {"x": carry["x"], "u": u}
+        step_cost = state["x"] @ Q_val @ state["x"] + u @ R_val @ u
+        new_state = {"x": x_next, "cost_sum": state["cost_sum"] + step_cost}
+        return new_state, {"x": state["x"], "u": u}
 
-    sim = ClosedLoop(init=init, step=step, n_steps=N_sim, finalize=lambda c, l: (l, c["cost_sum"]))
-    sim_logs, sim_total_cost = sim.run({"x0": x0_val})
+    sim = ClosedLoop(init=init, step=step, n_steps=N_sim, finalize=lambda c, l, cts: (c["cost_sum"],l))
+    sim_out = sim.run({"x0": x0_val})
 
     # --- Analytical Benchmark ---
     K0 = compute_finite_horizon_lqr_gain(A_val, B_val, Q_val, R_val, N)
@@ -158,9 +158,9 @@ def test_closed_loop_lqr_equivalence():
         
         x_curr = A_val @ x_curr + B_val @ u_curr
 
-    np.testing.assert_allclose(sim_logs["x"], jnp.stack(loop_xs), atol=1e-7)
-    np.testing.assert_allclose(sim_logs["u"], jnp.stack(loop_us), atol=1e-7)
-    np.testing.assert_allclose(sim_total_cost, loop_total_cost, atol=1e-7)
+    np.testing.assert_allclose(sim_out.trajectory["x"], jnp.stack(loop_xs), atol=1e-7)
+    np.testing.assert_allclose(sim_out.trajectory["u"], jnp.stack(loop_us), atol=1e-7)
+    np.testing.assert_allclose(float(sim_out.objective), loop_total_cost, atol=1e-7)
 
 
 # ======================================================================
@@ -190,16 +190,16 @@ def test_straight_through_gradients(mismatch):
     def run_sim(x0):
         def init(inputs, n_steps):
             prep = mpc.prepare({"A": A_nom, "B": B_nom, "Q": Q_val, "R": R_val})
-            return {"x": inputs["x0"], "prepared": prep}
+            return {"x": inputs["x0"]}, {"prepared": prep}
 
-        def step(carry, k):
-            fast_v = {"x0": carry["x"], "A": A_nom}
-            sol = mpc.solve_with_prepared(carry["prepared"], fast_v, None)
-            x_next = plant.step(carry["x"], sol["x"]["u0"], {"A": A_true}, {})
-            return {"x": x_next, "prepared": carry["prepared"]}, None
+        def step(state, k, constants):
+            fast_v = {"x0": state["x"], "A": A_nom}
+            sol = mpc.solve_with_prepared(constants["prepared"], fast_v, None)
+            x_next = plant.step(state["x"], sol["x"]["u0"], {"A": A_true}, {})
+            return {"x": x_next}, None
             
-        sim = ClosedLoop(init=init, step=step, n_steps=N_sim, finalize=lambda c, l: c["x"])
-        return sim.run({"x0": x0})
+        sim = ClosedLoop(init=init, step=step, n_steps=N_sim, finalize=lambda c, l, cts: (c["x"],l))
+        return sim.run({"x0": x0}).objective
 
     # Use our custom vmap(jvp) helper instead of jacfwd
     jax_jacobian = _compute_jacobian(run_sim, jnp.array([1.0, 1.0]))
@@ -243,19 +243,18 @@ def test_noisy_true_model():
 
         def init(inputs, n_steps):
             prep = mpc.prepare({"A": A_nom, "B": B_nom, "Q": Q_val, "R": R_val})
-            return {"x": inputs["x0"], "prepared": prep, "noise": inputs["noise"]}
+            return {"x": inputs["x0"]}, {"prepared": prep, "noise": inputs["noise"]}
 
-        def step(carry, k):
-            fast_v = {"x0": carry["x"], "A": A_nom}
-            sol = mpc.solve_with_prepared(carry["prepared"], fast_v, None)
+        def step(state, k, constants):
+            fast_v = {"x0": state["x"], "A": A_nom}
+            sol = mpc.solve_with_prepared(constants["prepared"], fast_v, None)
             
-            current_noise = carry["noise"][k]
-            x_next = plant.step(carry["x"], sol["x"]["u0"], {"noise": current_noise}, {})
-            
-            return {**carry, "x": x_next}, None
+            current_noise = constants["noise"][k]
+            x_next = plant.step(state["x"], sol["x"]["u0"], {"noise": current_noise}, {})
+            return {"x": x_next}, None
 
-        sim = ClosedLoop(init=init, step=step, n_steps=N_sim, finalize=lambda c, l: c["x"])
-        return sim.run({"x0": x0, "noise": noise_seq})
+        sim = ClosedLoop(init=init, step=step, n_steps=N_sim, finalize=lambda c, l, cts: (c["x"],None))
+        return sim.run({"x0": x0, "noise": noise_seq}).objective
 
     # 1. Compute the Jacobian of the noisy simulation using AD
     # (Relies on the _compute_jacobian vmap(jvp) helper defined previously)

@@ -2,7 +2,7 @@
 Differentiable MPC: tuning cost weights via gradient descent
 ============================================================
 
-This example shows how to use ``bpmpc_jax`` to tune the internal cost
+This example shows how to use ``bpmpc`` to tune the internal cost
 weights of a Model Predictive Controller end-to-end using Stochastic 
 Gradient Descent (SGD) across batches of initial states, model 
 uncertainties, and process noise.
@@ -17,20 +17,20 @@ import time
 
 jax.config.update("jax_enable_x64", True)
 
-from bpmpc_jax.variable import Variable
-from bpmpc_jax.mpc import MPCProblem, Cost
-from bpmpc_jax.mpc.helpers import (
+from bpmpc.variable import Variable
+from bpmpc.mpc import MPCProblem, Cost
+from bpmpc.mpc.helpers import (
     build_state_tracking, 
     nonlinear_dynamics, 
     box_bounds
 )
-from bpmpc_jax.closed_loop.helpers import (
+from bpmpc.closed_loop.helpers import (
     build_closed_loop_simulator, 
     quadratic_cost_and_penalty,
     dare_init_theta,
     closed_loop_tune
 )
-from bpmpc_jax.env import CartPendulum
+from bpmpc.env import CartPendulum
 from jaxsparrow import setup_sparse_solver
 
 

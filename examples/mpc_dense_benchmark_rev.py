@@ -26,9 +26,9 @@ import numpy as np
 # Enable 64-bit precision for stable QP solves
 jax.config.update("jax_enable_x64", True)
 
-from bpmpc_jax.mpc import Cost, Constraint, MPCProblem
-from bpmpc_jax.mpc.helpers import lti_dynamics, box_bounds
-from bpmpc_jax.variable import Variable
+from bpmpc.mpc import Cost, Constraint, MPCProblem
+from bpmpc.mpc.helpers import lti_dynamics, box_bounds
+from bpmpc.variable import Variable
 from jaxsparrow import setup_dense_solver
 
 

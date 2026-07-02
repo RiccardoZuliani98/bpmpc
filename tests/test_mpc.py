@@ -1,4 +1,4 @@
-"""Tests for the bpmpc_jax MPC utility.
+"""Tests for the bpmpc MPC utility.
 
 Covers a variety of MPC problem formulations by actively solving the 
 resulting QPs using `jaxsparrow`:
@@ -36,8 +36,8 @@ import scipy.sparse as sp
 
 jax.config.update("jax_enable_x64", True)
 
-from bpmpc_jax.variable import Variable
-from bpmpc_jax.mpc import Cost, Constraint, SlackSpec, MPCProblem
+from bpmpc.variable import Variable
+from bpmpc.mpc import Cost, Constraint, SlackSpec, MPCProblem
 
 # Use the real dense solver
 from jaxsparrow import setup_dense_solver, setup_sparse_solver

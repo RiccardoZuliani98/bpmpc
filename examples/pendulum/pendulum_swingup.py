@@ -2,7 +2,7 @@
 Differentiable MPC: tuning cost weights via gradient descent
 ============================================================
 
-This example shows how to use ``bpmpc_jax`` to tune the *internal* cost
+This example shows how to use ``bpmpc`` to tune the *internal* cost
 weights of a Model Predictive Controller end-to-end, so that the resulting
 *closed-loop* behaviour is optimal with respect to a separate task cost.
 """
@@ -15,20 +15,20 @@ import optax
 
 jax.config.update("jax_enable_x64", True)
 
-from bpmpc_jax.variable import Variable
-from bpmpc_jax.mpc import MPCProblem, Cost
-from bpmpc_jax.mpc.helpers import (
+from bpmpc.variable import Variable
+from bpmpc.mpc import MPCProblem, Cost
+from bpmpc.mpc.helpers import (
     build_state_tracking, 
     nonlinear_dynamics, 
     box_bounds
 )
-from bpmpc_jax.closed_loop.helpers import (
+from bpmpc.closed_loop.helpers import (
     build_closed_loop_simulator, 
     quadratic_cost_and_penalty,
     dare_init_theta,
     closed_loop_tune
 )
-from bpmpc_jax.env import CartPendulum
+from bpmpc.env import CartPendulum
 from jaxsparrow import setup_sparse_solver
 
 
@@ -209,7 +209,7 @@ theta_init = jnp.concatenate([
 
 # Construct loss
 rollout_fn = jax.jit(lambda p: simulate_closed_loop_fn.run(inputs={"p":p, "x0":X0_INIT}))
-loss_fn = lambda p: rollout_fn(p)["cost"]
+loss_fn = lambda p: rollout_fn(p).objective
 
 # Setup a custom optimizer
 optimizer = optax.chain(
@@ -226,44 +226,44 @@ if __name__ == "__main__":
     
     # 1. Roll out with the initial DARE-based parameters.
     print("Rolling out with initial parameters...")
-    traj_before = rollout_fn(theta_init)
-    print(f"  Initial task cost: {float(traj_before['cost']):.2f}\n")
+    out_before = rollout_fn(theta_init)
+    print(f"  Initial task cost: {float(out_before.objective):.2f}\n")
 
     # 2. Tune.
     theta_final, _ = closed_loop_tune(
         loss_fn=loss_fn,
         initial_params=theta_init,
         optimizer=optimizer,
-        n_iters=100
+        n_iters=N_ITER
     )
 
     # 3. Roll out with the optimised parameters.
     print("\nRolling out with optimised parameters...")
-    traj_after = rollout_fn(theta_final)
-    print(f"  Final task cost: {float(traj_after['cost']):.2f}\n")
+    out_after = rollout_fn(theta_final)
+    print(f"  Final task cost: {float(out_after.objective):.2f}\n")
 
     # 4. Compare.
     t = np.arange(HORIZON_SIM) * DT
 
     fig, axes = plt.subplots(3, 1, figsize=(8.5, 7.5), sharex=True)
 
-    axes[0].plot(t, traj_before["xs"][:, 0], linestyle="--", color="tab:gray", label="before")
-    axes[0].plot(t, traj_after["xs"][:, 0], color="tab:blue", label="after")
+    axes[0].plot(t, out_before.trajectory["x"][:, 0], linestyle="--", color="tab:gray", label="before")
+    axes[0].plot(t, out_after.trajectory["x"][:, 0], color="tab:blue", label="after")
     axes[0].axhline(0.0, color="k", linewidth=0.5, linestyle=":")
     axes[0].set_ylabel("Cart position [m]")
     axes[0].grid(True, alpha=0.3)
     axes[0].legend(loc="best")
 
-    axes[1].plot(t, traj_before["xs"][:, 2], linestyle="--", color="tab:gray", label="before")
-    axes[1].plot(t, traj_after["xs"][:, 2], color="tab:orange", label="after")
+    axes[1].plot(t, out_before.trajectory["x"][:, 2], linestyle="--", color="tab:gray", label="before")
+    axes[1].plot(t, out_after.trajectory["x"][:, 2], color="tab:orange", label="after")
     axes[1].axhline( 0.0,    color="g", linewidth=0.6, linestyle=":", label="upright")
     axes[1].axhline(-np.pi,  color="r", linewidth=0.6, linestyle=":", label="hanging")
     axes[1].set_ylabel("Pole angle [rad]")
     axes[1].grid(True, alpha=0.3)
     axes[1].legend(loc="best", ncol=2)
 
-    axes[2].plot(t, traj_before["us"][:, 0], linestyle="--", color="tab:gray", label="before")
-    axes[2].plot(t, traj_after["us"][:, 0], color="tab:green", label="after")
+    axes[2].plot(t, out_before.trajectory["u"][:, 0], linestyle="--", color="tab:gray", label="before")
+    axes[2].plot(t, out_after.trajectory["u"][:, 0], color="tab:green", label="after")
     axes[2].axhline(float(U_MAX_MPC[0]), color="r", linewidth=0.6, linestyle=":")
     axes[2].axhline(float(U_MIN_MPC[0]), color="r", linewidth=0.6, linestyle=":")
     axes[2].set_ylabel("Control input [N]")

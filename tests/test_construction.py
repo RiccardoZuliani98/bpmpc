@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import jax.numpy as jnp
 
-from bpmpc_jax.mpc import Cost, Constraint, MPCProblem
+from bpmpc.mpc import Cost, Constraint, MPCProblem
 from conftest import N_VAR, N_EQ, N_INEQ
 
 

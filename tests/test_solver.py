@@ -9,7 +9,7 @@ import jax.numpy as jnp
 
 from jax.experimental.sparse import BCOO
 
-from bpmpc_jax.mpc import MPCSolver, MPCProblem
+from bpmpc.mpc import MPCSolver, MPCProblem
 from conftest import N_VAR, N_EQ, N_INEQ, NX, dummy_solver
 
 def to_dense(mat):

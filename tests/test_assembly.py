@@ -33,7 +33,7 @@ def test_cost_diagonal(problem):
     qp = problem.solve_from(problem.prepare({"p": p_v}), {"x0": jnp.zeros(NX)})
     
     P_diag = jnp.diag(to_dense(qp.P))
-    expected = jnp.concatenate([p_v**2 + 1e-8, 10.0 * jnp.ones(N_INEQ)])
+    expected = jnp.concatenate([p_v**2 + 1e-8, 20.0 * jnp.ones(N_INEQ)]) # multiply by two to counteract the 0.5
     np.testing.assert_allclose(P_diag, expected, rtol=1e-5)
 
 

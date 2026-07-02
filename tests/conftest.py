@@ -8,8 +8,8 @@ from __future__ import annotations
 import jax.numpy as jnp
 import pytest
 
-from bpmpc_jax.variable import Variable
-from bpmpc_jax.mpc import Cost, Constraint, SlackSpec, MPCProblem
+from bpmpc.variable import Variable
+from bpmpc.mpc import Cost, Constraint, SlackSpec, MPCProblem
 
 NX, NU, N, DT = 2, 1, 20, 0.1
 

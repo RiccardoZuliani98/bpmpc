@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from bpmpc_jax.mpc import SlackSpec
+from bpmpc.mpc import SlackSpec
 
 
 def test_slack_all_and_none():

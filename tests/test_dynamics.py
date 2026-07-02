@@ -4,8 +4,8 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from bpmpc_jax.dynamics import Dynamics
-from bpmpc_jax.variable import Variable
+from bpmpc.dynamics import Dynamics
+from bpmpc.variable import Variable
 
 jax.config.update("jax_enable_x64", True)
 

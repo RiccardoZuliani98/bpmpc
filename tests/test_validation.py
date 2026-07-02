@@ -5,7 +5,7 @@ from __future__ import annotations
 import jax.numpy as jnp
 import pytest
 
-from bpmpc_jax.mpc import Cost, Constraint, MPCProblem
+from bpmpc.mpc import Cost, Constraint, MPCProblem
 
 
 def test_no_costs(dynamics_obj, ic_obj, bounds_obj):

@@ -6,8 +6,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from bpmpc_jax.variable import Variable
-from bpmpc_jax.mpc import Constraint, SlackSpec
+from bpmpc.variable import Variable
+from bpmpc.mpc import Constraint, SlackSpec
 
 
 def test_constant_constraint():

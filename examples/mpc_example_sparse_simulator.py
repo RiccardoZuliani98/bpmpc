@@ -31,13 +31,13 @@ import numpy as np
 
 jax.config.update("jax_enable_x64", True)
 
-from bpmpc_jax.mpc import (
+from bpmpc.mpc import (
     Cost, Constraint, MPCProblem,
 )
-from bpmpc_jax.closed_loop import ClosedLoop, RunLogger, TrajectoryStorage
-from bpmpc_jax.mpc.helpers import lti_dynamics, box_bounds
-from bpmpc_jax.dynamics import Dynamics
-from bpmpc_jax.variable import Variable
+from bpmpc.closed_loop import ClosedLoop, RunLogger, TrajectoryStorage
+from bpmpc.mpc.helpers import lti_dynamics, box_bounds
+from bpmpc.dynamics import Dynamics
+from bpmpc.variable import Variable
 from jaxsparrow import setup_sparse_solver
 
 
@@ -128,6 +128,7 @@ def nominal_step(state, action, _params):
     return A_d @ state + (B_d @ action[:, None]).squeeze(-1)
 
 plant = Dynamics(
+    nx=nx,nu=nu,
     true_fun=true_step,
     nominal_fun=nominal_step,
     true_params_spec=(v_w,),
