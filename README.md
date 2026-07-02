@@ -1,4 +1,4 @@
-# bpmpc_jax: Differentiable Model Predictive Control in JAX
+# bpmpc: Differentiable Model Predictive Control in JAX
 
 `bpmpc_jax` is a high-performance, fully differentiable Model Predictive Control (MPC) framework built natively in JAX. It provides a modular, symbolic API to design parametric optimization problems, compiles them into blazing-fast XLA executables, and allows you to differentiate directly through your closed-loop control trajectories.
 
