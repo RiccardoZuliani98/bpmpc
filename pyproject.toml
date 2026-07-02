@@ -8,18 +8,15 @@ version = "0.1.0"
 description = "Parametric MPC builder on JAX"
 requires-python = ">=3.10"
 dependencies = [
-    "jax>=0.4.20",
-    "jaxlib>=0.4.20",
-    "numpy>=1.24",
-    "optax>=0.2.8",
-    "matplotlib>=3.11.0",
+    "jax",
+    "optax",
     "jaxsparrow @ git+https://github.com/RiccardoZuliani98/jaxsparrow.git@main",
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=7.0",
-]
+test = ["pytest"]
+plot = ["matplotlib"]
+dev = ["pytest", "matplotlib"]
 
 # ── Hatch build config ──────────────────────────────────────────────
 [tool.hatch.build.targets.wheel]
