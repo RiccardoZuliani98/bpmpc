@@ -297,6 +297,26 @@ class TestBoxBounds:
         assert lhs_num.shape == (N_INEQ, N_VAR)
         assert rhs_num.shape == (N_INEQ,)
 
+    def test_box_bounds_dropped_rows_match_masked_full(self):
+        """Row-selected LHS must equal masking the full [Fx; -Fx; Fu; -Fu]."""
+        x_max = jnp.array([5.0, jnp.inf])       # second state upper bound dropped
+        u_min = jnp.array([-jnp.inf])           # input lower bound dropped
+        bounds = box_bounds(horizon=N, x_min=X_MIN, x_max=x_max,
+                            u_min=u_min, u_max=U_MAX)
+
+        keep = jnp.concatenate([
+            jnp.tile(jnp.isfinite(x_max), N),
+            jnp.tile(jnp.isfinite(X_MIN), N),
+            jnp.tile(jnp.isfinite(U_MAX), N),
+            jnp.tile(jnp.isfinite(u_min), N),
+        ])
+        expected_lhs = build_box_lhs(NX, NU, N)[keep]
+        expected_rhs = build_box_rhs(X_MIN, x_max, u_min, U_MAX, N)[keep]
+
+        assert jnp.array_equal(bounds.eval_lhs({}), expected_lhs)
+        assert jnp.array_equal(bounds.eval_rhs({}), expected_rhs)
+        assert bounds.n_cst == int(keep.sum())
+
     def test_box_bounds_partial(self):
         # Only constrain U, leave X unbounded
         bounds = box_bounds(horizon=N, u_min=U_MIN, u_max=U_MAX, n_x=NX)
@@ -492,6 +512,75 @@ class TestCosts:
         cost_loop += err_x_N.T @ Q_seq[N] @ err_x_N
 
         assert jnp.isclose(cost_matrix, cost_loop)
+
+    def test_output_tracking_loop_equivalence_random(self):
+        """Blockwise (P, q, c) must match an explicit per-step accumulation.
+
+        Complements ``test_output_tracking_loop_equivalence`` with dense
+        random C/D and a full (non-diagonal) PSD weight, which exercises
+        the state/input cross blocks.
+        """
+        NY = 3
+        rng = np.random.default_rng(0)
+        C_seq = jnp.array(rng.normal(size=(N + 1, NY, NX)))
+        D_seq = jnp.array(rng.normal(size=(N, NY, NU)))
+        r_seq = jnp.array(rng.normal(size=(N + 1, NY)))
+        # Symmetric PSD weights, so the quadratic form is a genuine norm.
+        W = rng.normal(size=(N + 1, NY, NY))
+        Q_seq = jnp.array(np.einsum("tij,tkj->tik", W, W) + np.eye(NY))
+
+        P, q, c = build_output_tracking(C_seq, D_seq, r_seq, Q_seq, X0_VAL, N)
+
+        X_seq = jnp.arange(N * NX).reshape(N, NX) * 0.1
+        U_seq = jnp.arange(N * NU).reshape(N, NU) * -0.1
+        z = jnp.concatenate([X_seq.reshape(-1), U_seq.reshape(-1)])
+        cost_matrix = 0.5 * z.T @ P @ z + q.T @ z + c
+
+        x_traj = jnp.vstack([X0_VAL, X_seq])
+        cost_loop = 0.0
+        for k in range(N):
+            e = C_seq[k] @ x_traj[k] + D_seq[k] @ U_seq[k] - r_seq[k]
+            cost_loop += e.T @ Q_seq[k] @ e
+        e_N = C_seq[N] @ x_traj[N] - r_seq[N]
+        cost_loop += e_N.T @ Q_seq[N] @ e_N
+
+        assert jnp.isclose(cost_matrix, cost_loop)
+
+    def test_split_builders_match_combined(self):
+        """The per-field builders must agree with the combined tuple builders."""
+        from bpmpc.mpc.helpers._src.costs import (
+            build_state_tracking_mat, build_state_tracking_vec,
+            build_state_tracking_const,
+            build_output_tracking_mat, build_output_tracking_vec,
+            build_output_tracking_const,
+        )
+        NY = 3
+        rng = np.random.default_rng(7)
+        Q_x = jnp.array(rng.normal(size=(N + 1, NX, NX)))
+        R_u = jnp.array(rng.normal(size=(N, NU, NU)))
+        rx = jnp.array(rng.normal(size=(N + 1, NX)))
+        ru = jnp.array(rng.normal(size=(N, NU)))
+
+        P, q, c = build_state_tracking(Q_x, R_u, rx, ru, X0_VAL, N)
+        assert jnp.array_equal(P, build_state_tracking_mat(Q_x, R_u, N))
+        assert jnp.array_equal(q, build_state_tracking_vec(Q_x, R_u, rx, ru, N))
+        assert jnp.array_equal(
+            c, build_state_tracking_const(Q_x, R_u, rx, ru, X0_VAL, N)
+        )
+
+        C_seq = jnp.array(rng.normal(size=(N + 1, NY, NX)))
+        D_seq = jnp.array(rng.normal(size=(N, NY, NU)))
+        r_seq = jnp.array(rng.normal(size=(N + 1, NY)))
+        Q_y = jnp.array(rng.normal(size=(N + 1, NY, NY)))
+
+        P, q, c = build_output_tracking(C_seq, D_seq, r_seq, Q_y, X0_VAL, N)
+        assert jnp.array_equal(P, build_output_tracking_mat(C_seq, D_seq, Q_y, N))
+        assert jnp.array_equal(
+            q, build_output_tracking_vec(C_seq, D_seq, r_seq, Q_y, X0_VAL, N)
+        )
+        assert jnp.array_equal(
+            c, build_output_tracking_const(C_seq, r_seq, Q_y, X0_VAL)
+        )
 
     def test_output_tracking_builder(self):
         NY = 3

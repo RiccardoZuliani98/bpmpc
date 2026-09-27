@@ -15,8 +15,9 @@ Decision vector layout::
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, Tuple
 
+import numpy as np
 import jax.numpy as jnp
 from jax import Array
 
@@ -31,6 +32,39 @@ from bpmpc.mpc._src.partition import Partition
 # Builders
 # ======================================================================
 
+def _box_lhs_columns(n_x: int, n_u: int, horizon: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Column index and sign of the single non-zero in each box row.
+
+    Every row of the box LHS selects exactly one decision variable, so the
+    whole matrix is described by one column index and one sign per row.
+    """
+    N = horizon
+    x_cols = np.arange(N * n_x)
+    u_cols = N * n_x + np.arange(N * n_u)
+    cols = np.concatenate([x_cols, x_cols, u_cols, u_cols])
+    signs = np.concatenate([
+        np.ones(N * n_x), -np.ones(N * n_x),
+        np.ones(N * n_u), -np.ones(N * n_u),
+    ])
+    return cols, signs
+
+
+def _build_box_lhs_rows(
+    n_x: int, n_u: int, horizon: int, keep_rows: np.ndarray,
+) -> Array:
+    """Build the box LHS restricted to ``keep_rows`` of the full matrix.
+
+    Selecting rows up front avoids materialising the full
+    ``(2*n_z, n_z)`` matrix and then copying it through a mask.
+    """
+    cols, signs = _box_lhs_columns(n_x, n_u, horizon)
+    n_rows = len(keep_rows)
+    out = jnp.zeros((n_rows, horizon * (n_x + n_u)))
+    return out.at[jnp.arange(n_rows), jnp.asarray(cols[keep_rows])].set(
+        jnp.asarray(signs[keep_rows])
+    )
+
+
 def build_box_lhs(n_x: int, n_u: int, horizon: int) -> Array:
     """Build the constant LHS for box constraints.
 
@@ -41,12 +75,8 @@ def build_box_lhs(n_x: int, n_u: int, horizon: int) -> Array:
     where ``Fx = [I | 0]`` selects states and ``Fu = [0 | I]``
     selects inputs.
     """
-    N = horizon
-    n_x_total = N * n_x
-    n_u_total = N * n_u
-    Fx = jnp.concatenate([jnp.eye(n_x_total), jnp.zeros((n_x_total, n_u_total))], axis=1)
-    Fu = jnp.concatenate([jnp.zeros((n_u_total, n_x_total)), jnp.eye(n_u_total)], axis=1)
-    return jnp.concatenate([Fx, -Fx, Fu, -Fu])
+    n_rows = 2 * horizon * (n_x + n_u)
+    return _build_box_lhs_rows(n_x, n_u, horizon, np.arange(n_rows))
 
 
 def build_box_rhs(
@@ -128,12 +158,7 @@ def box_bounds(
     if n_u_val is None:
         raise ValueError("Could not infer n_u. Please provide n_u explicitly or at least one input bound.")
 
-    lhs_val = build_box_lhs(n_x_val, n_u_val, N)
-
-    def lhs(_: Dict[str, Array]) -> Array:
-        return lhs_val
-
-    def rhs(v: Dict[str, Array]) -> Array:
+    def rhs_full(v: Dict[str, Array]) -> Array:
         _x_min = resolve(x_min, v) if x_min is not None else jnp.full((n_x_val,), -jnp.inf)
         _x_max = resolve(x_max, v) if x_max is not None else jnp.full((n_x_val,), jnp.inf)
         _u_min = resolve(u_min, v) if u_min is not None else jnp.full((n_u_val,), -jnp.inf)
@@ -156,8 +181,18 @@ def box_bounds(
         return jnp.isfinite(jnp.asarray(b))
     mask = jnp.concatenate([jnp.tile(_keep(b, d), N) for b, d in
         ((x_max, n_x_val), (x_min, n_x_val), (u_max, n_u_val), (u_min, n_u_val))])
-    lhs_val = lhs_val[mask]
-    _rhs, rhs = rhs, lambda v: _rhs(v)[mask]
+
+    # The mask is known at build time, so the kept rows can be built
+    # directly instead of slicing a full (2*n_z, n_z) matrix.
+    keep_rows = np.nonzero(np.asarray(mask))[0]
+    lhs_val = _build_box_lhs_rows(n_x_val, n_u_val, N, keep_rows)
+    keep_idx = jnp.asarray(keep_rows)
+
+    def lhs(_: Dict[str, Array]) -> Array:
+        return lhs_val
+
+    def rhs(v: Dict[str, Array]) -> Array:
+        return rhs_full(v)[keep_idx]
 
     return Constraint(
         "inequality", lhs=lhs, rhs=rhs,

@@ -32,6 +32,32 @@ from bpmpc.mpc._src.partition import Partition
 
 
 # ======================================================================
+# Shared index helpers
+# ======================================================================
+
+def _block_indices(N: int, n_x: int, n_u: int):
+    """Row/column index grids for the per-step blocks of the LHS.
+
+    Returns ``(rows, cols_x, cols_u)``, each shaped ``(N, ·)``, where
+    ``rows[k]`` are the global rows of dynamics block ``k``, ``cols_x[k]``
+    the columns of state ``x_{k+1}`` and ``cols_u[k]`` those of ``u_k``.
+    """
+    ks = jnp.arange(N)[:, None]
+    rows = ks * n_x + jnp.arange(n_x)[None, :]
+    cols_u = N * n_x + ks * n_u + jnp.arange(n_u)[None, :]
+    return rows, rows, cols_u
+
+
+def _lhs_dtype(*arrs: Array) -> jnp.dtype:
+    """Result dtype matching the previous ``kron``/``zeros`` construction.
+
+    The old builders started from ``jnp.eye``/``jnp.zeros``, so the output
+    was always promoted against the default float type.
+    """
+    return jnp.result_type(*arrs, jnp.zeros(()).dtype)
+
+
+# ======================================================================
 # LTI builders
 # ======================================================================
 
@@ -47,16 +73,24 @@ def build_lti_lhs(A: Array, B: Array, horizon: int) -> Array:
         F_u = kron(I_N, B)
         F   = [F_x | F_u]
 
-    where ``S`` is the sub-diagonal shift matrix.
+    where ``S`` is the sub-diagonal shift matrix.  The blocks are
+    scattered straight into a single allocation — building them via
+    ``kron`` and concatenating costs several dense temporaries.
     """
     n_x, n_u = A.shape[0], B.shape[1]
     N = horizon
-    I_N = jnp.eye(N)
-    I_x = jnp.eye(n_x)
-    S = jnp.eye(N, k=-1)
-    Fx = -jnp.kron(I_N, I_x) + jnp.kron(S, A)
-    Fu = jnp.kron(I_N, B)
-    return jnp.concatenate([Fx, Fu], axis=1)
+    rows, cols_x, cols_u = _block_indices(N, n_x, n_u)
+
+    F = jnp.zeros((N * n_x, N * n_x + N * n_u), dtype=_lhs_dtype(A, B))
+    # -I on the block diagonal (state k+1), A on the sub-diagonal (state k)
+    F = F.at[rows, cols_x].set(-1.0)
+    F = F.at[rows[1:, :, None], cols_x[:-1, None, :]].set(
+        jnp.broadcast_to(A, (N - 1, n_x, n_x))
+    )
+    # B on the block diagonal of the input columns
+    return F.at[rows[:, :, None], cols_u[:, None, :]].set(
+        jnp.broadcast_to(B, (N, n_x, n_u))
+    )
 
 
 def build_lti_rhs(
@@ -98,23 +132,14 @@ def build_ltv_lhs(A: Array, B: Array, horizon: int) -> Array:
     N = horizon
     n_x = A.shape[1]
     n_u = B.shape[2]
-    n_x_total = N * n_x
-    n_u_total = N * n_u
+    rows, cols_x, cols_u = _block_indices(N, n_x, n_u)
 
-    ks = jnp.arange(N)
-    i_x = jnp.arange(n_x)
-    j_x = jnp.arange(n_x)
-    i_u = jnp.arange(n_u)
-
-    fx = -jnp.kron(jnp.eye(N), jnp.eye(n_x))
-    row_base = (ks[:, None, None] * n_x) + i_x[None, :, None]
-    col_base = (ks[:, None, None] * n_x) + j_x[None, None, :]
-    fx = fx.at[row_base[1:], col_base[:-1]].set(A[1:])
-
-    cols_B = (ks[:, None, None] * n_u) + i_u[None, None, :]
-    fu = jnp.zeros((n_x_total, n_u_total)).at[row_base, cols_B].set(B)
-
-    return jnp.concatenate([fx, fu], axis=1)
+    # One allocation for [F_x | F_u]; the old version built both halves
+    # separately (plus a ``kron`` for the identity) and concatenated them.
+    F = jnp.zeros((N * n_x, N * n_x + N * n_u), dtype=_lhs_dtype(A, B))
+    F = F.at[rows, cols_x].set(-1.0)
+    F = F.at[rows[1:, :, None], cols_x[:-1, None, :]].set(A[1:])
+    return F.at[rows[:, :, None], cols_u[:, None, :]].set(B)
 
 
 def build_ltv_rhs(
