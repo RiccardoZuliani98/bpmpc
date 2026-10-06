@@ -80,6 +80,9 @@ class _SolveFnDebug(Protocol):
 class _SolveWithPreparedFn(Protocol):
     def __call__(self, prepared_qp: QPData, fast_v: ArrayIn, warmstart: Any = None) -> Any: ...
 
+class _SolveAllFn(Protocol):
+    def __call__(self, v: ArrayIn, warmstart: Any = None) -> Any: ...
+
 class MPCSolver(NamedTuple):
     """Ready-to-call MPC solver produced by attaching a numerical solver to a problem.
 
@@ -99,6 +102,13 @@ class MPCSolver(NamedTuple):
         A function that evaluates the "fast" parametric terms, applies them on top 
         of a pre-computed `QPData` (from ``prepare``), and runs the numerical solver.
         Signature is ``solve_with_prepared(prepared_qp, fast_v, warmstart=None)``.
+    prepare_all : Callable[[ArrayIn], QPData]
+        A function that evaluates both slow and fast parametric terms from a single 
+        dictionary and returns the fully assembled `QPData`.
+    solve_all : Callable[[ArrayIn, Any], Any]
+        A function that assembles the full QP from a single dictionary of slow and 
+        fast variables, and runs the numerical solver.
+        Signature is ``solve_all(v, warmstart=None)``.
     n_var : int
         The original number of decision variables (excluding slack variables).
     n_dec : int
@@ -117,6 +127,8 @@ class MPCSolver(NamedTuple):
     solve:               _SolveFn
     solve_debug:         _SolveFnDebug
     solve_with_prepared: _SolveWithPreparedFn
+    prepare_all:         Callable[[ArrayIn], QPData]
+    solve_all:           _SolveAllFn
     n_var:               int
     n_dec:               int
     n_eq:                int
@@ -342,6 +354,26 @@ class MPCProblem:
         a = self._assembler
         return a.apply(a.base_qp, a.slow_terms, slow_v)
 
+    def prepare_all(self, v: ArrayIn) -> QPData:
+        """Evaluates and applies both slow and fast parametric terms in one pass.
+
+        Equivalent to ``solve_from(prepare(slow_v), fast_v)``, but takes a single
+        dictionary and applies all terms in one ``apply`` call, avoiding the
+        intermediate QPData.
+
+        Parameters
+        ----------
+        v : ArrayIn
+            A dictionary of evaluated arrays for all variables (slow and fast).
+
+        Returns
+        -------
+        QPData
+            A completely assembled QPData object ready for numerical resolution.
+        """
+        a = self._assembler
+        return a.apply(a.base_qp, [*a.slow_terms, *a.fast_terms], v)
+
     def solve_from(self, prepared: QPData, fast_v: ArrayIn) -> QPData:
         """Evaluates and applies the fast parametric terms on top of a prepared QP.
 
@@ -373,8 +405,8 @@ class MPCProblem:
         Returns
         -------
         MPCSolver
-            A fully configured solver interface exposing ``prepare``, ``solve``, and 
-            ``solve_with_prepared`` methods.
+            A fully configured solver interface exposing ``prepare``, ``solve``, 
+            ``solve_with_prepared``, ``prepare_all``, and ``solve_all`` methods.
         """
         partition = self.output_partition
 
@@ -458,10 +490,20 @@ class MPCProblem:
             qp = self.solve_from(prepared_qp, fast_v)
             return _call_solver(qp, warmstart)
 
+        def prepare_all(v: ArrayIn) -> QPData:
+            return self.prepare_all(v)
+
+        def solve_all(v: ArrayIn, warmstart: Any = None) -> Any:
+            """Solves the problem from a single dictionary of slow and fast variables."""
+            qp = self.prepare_all(v)
+            return _call_solver(qp, warmstart)
+
         return MPCSolver(
             prepare=prepare, 
             solve=solve, 
             solve_with_prepared=solve_with_prepared,
+            prepare_all=prepare_all,
+            solve_all=solve_all,
             solve_debug=solve_debug,
             n_var=self.n_var, n_dec=self.n_dec,
             n_eq=self.n_eq, n_ineq=self.n_ineq,
