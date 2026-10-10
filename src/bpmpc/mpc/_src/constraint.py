@@ -15,11 +15,12 @@ from typing import Callable, Dict, Literal, Optional, Sequence, Union
 
 import jax.numpy as jnp
 from jax import Array
+from jax.experimental.sparse import BCOO
 
 from bpmpc.variable             import Variable
 from bpmpc.mpc._src.slack       import SlackSpec
 from bpmpc.mpc._src.types       import ArrayIn, NonZeros
-from bpmpc.mpc._src.validation  import validate_shared_variables, make_sample, merge_v_in
+from bpmpc.mpc._src.validation  import validate_shared_variables, make_sample, merge_v_in, split_bcoo
 from bpmpc.mpc._src.partition   import Partition
 
 
@@ -30,8 +31,11 @@ class Constraint:
     ----------
     cst_type : Literal["equality", "inequality"]
         The type of constraint ('equality' or 'inequality').
-    lhs : Union[Array, Callable[[ArrayIn], Array]]
+    lhs : Union[Array, BCOO, Callable[[ArrayIn], Union[Array, BCOO]]]
         Callable returning the left-hand side matrix of shape ``(n_cst, n_var)``, or a constant array.
+        It may return (or be) a ``BCOO`` whose indices do not depend on the
+        inputs; its non-zeros are then taken from the BCOO, exactly as if
+        ``lhs_nz`` had been given.
     rhs : Union[Array, Callable[[ArrayIn], Array]]
         Callable returning the right-hand side vector of shape ``(n_cst,)``, or a constant array.
     v_in_lhs : Optional[Dict[str, Variable]], default None
@@ -48,7 +52,8 @@ class Constraint:
     lhs_nz : Optional[NonZeros], default None
         Optional coordinate description of ``lhs``'s non-zeros.  When given,
         the sparse assembler writes only these entries instead of
-        materialising the dense ``(n_cst, n_var)`` matrix.
+        materialising the dense ``(n_cst, n_var)`` matrix.  Not allowed when
+        ``lhs`` returns a ``BCOO``.
 
     Attributes
     ----------
@@ -110,7 +115,9 @@ class Constraint:
         if v_in_lhs is not None and v_in_rhs is not None:
             validate_shared_variables(v_in_lhs, v_in_rhs, "lhs", "rhs")
 
-        if callable(lhs):
+        if isinstance(lhs, BCOO):
+            self._lhs = lambda _: lhs
+        elif callable(lhs):
             self._lhs = lhs
         else:
             _lhs_arr = jnp.asarray(lhs)
@@ -124,6 +131,9 @@ class Constraint:
 
         lhs_sample = make_sample(v_in_lhs)
         lhs_num = self._lhs(lhs_sample)
+        if isinstance(lhs_num, BCOO):
+            self._lhs, lhs_nz, lhs_num = split_bcoo(
+                self._lhs, lhs_num, v_in_lhs, lhs_nz, "lhs")
         rhs_num = self._rhs(make_sample(v_in_rhs))
         self._validate_shapes(lhs_num, rhs_num)
 

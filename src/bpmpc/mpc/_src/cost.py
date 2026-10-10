@@ -15,10 +15,11 @@ from typing import Callable, Dict, Optional, Union
 
 import jax.numpy as jnp
 from jax import Array
+from jax.experimental.sparse import BCOO
 
 from bpmpc.variable             import Variable
 from bpmpc.mpc._src.types       import ArrayIn, NonZeros
-from bpmpc.mpc._src.validation  import validate_shared_variables, make_sample, merge_v_in
+from bpmpc.mpc._src.validation  import validate_shared_variables, make_sample, merge_v_in, split_bcoo
 from bpmpc.mpc._src.partition   import Partition
 
 
@@ -27,8 +28,11 @@ class Cost:
 
     Parameters
     ----------
-    q_mat : Union[Array, Callable[[ArrayIn], Array]]
+    q_mat : Union[Array, BCOO, Callable[[ArrayIn], Union[Array, BCOO]]]
         Callable returning the symmetric quadratic matrix term, shape ``(n_var, n_var)``, or a constant array.
+        It may return (or be) a ``BCOO`` whose indices do not depend on the
+        inputs; its non-zeros are then taken from the BCOO, exactly as if
+        ``q_mat_nz`` had been given.
     q_vec : Optional[Union[Array, Callable[[ArrayIn], Array]]], default None
         Callable returning the linear vector term, shape ``(n_var,)``, or a constant array.
     c : Optional[Union[Array, float, Callable[[ArrayIn], Array]]], default None
@@ -44,7 +48,8 @@ class Cost:
     q_mat_nz : Optional[NonZeros], default None
         Optional coordinate description of ``q_mat``'s non-zeros.  When
         given, the sparse assembler writes only these entries instead of
-        materialising the dense ``(n_var, n_var)`` matrix.
+        materialising the dense ``(n_var, n_var)`` matrix.  Not allowed when
+        ``q_mat`` returns a ``BCOO``.
 
     Attributes
     ----------
@@ -100,7 +105,9 @@ class Cost:
         # --------------------------------------------------------------
         # Normalize and Probe q_mat
         # --------------------------------------------------------------
-        if callable(q_mat):
+        if isinstance(q_mat, BCOO):
+            _q_mat_fn = lambda _: q_mat
+        elif callable(q_mat):
             _q_mat_fn = q_mat
         else:
             _q_mat_arr = jnp.asarray(q_mat)
@@ -108,6 +115,9 @@ class Cost:
 
         q_mat_sample = make_sample(v_in_q_mat)
         q_mat_num = _q_mat_fn(q_mat_sample)
+        if isinstance(q_mat_num, BCOO):
+            _q_mat_fn, q_mat_nz, q_mat_num = split_bcoo(
+                _q_mat_fn, q_mat_num, v_in_q_mat, q_mat_nz, "q_mat")
         if q_mat_num.ndim != 2:
             raise ValueError(
                 f"q_mat must return a 2-D array, got ndim={q_mat_num.ndim}, "

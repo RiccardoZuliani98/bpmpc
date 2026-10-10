@@ -1,18 +1,21 @@
 """Plumbing shared by :class:`Cost` and :class:`Constraint`.
 
-These helper functions validate and merge variable dictionaries, and produce
-random sample inputs for probing user callables.
+These helper functions validate and merge variable dictionaries, produce
+random sample inputs for probing user callables, and turn callables that
+return a ``BCOO`` into a dense callable plus its :class:`NonZeros`.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 import jax.numpy as jnp
+from jax import Array
+from jax.experimental.sparse import BCOO
 
 from bpmpc.variable import Variable
-from bpmpc.mpc._src.types import ArrayIn
+from bpmpc.mpc._src.types import ArrayIn, NonZeros
 
 
 # ======================================================================
@@ -109,3 +112,69 @@ def make_sample(v_in: Optional[Dict[str, Variable]]) -> ArrayIn:
         key: jnp.asarray(np.random.rand(*var.shape))
         for key, var in v_in.items()
     }
+
+
+# ======================================================================
+# BCOO outputs
+# ======================================================================
+
+def split_bcoo(
+    fn:   Callable[[ArrayIn], BCOO],
+    out:  BCOO,
+    v_in: Optional[Dict[str, Variable]],
+    nz:   Optional[NonZeros],
+    what: str,
+) -> Tuple[Callable[[ArrayIn], Array], NonZeros, Array]:
+    """Splits a callable returning a ``BCOO`` into a dense callable and its non-zeros.
+
+    The BCOO's ``indices`` become the static coordinates and its ``data``
+    the values, so the sparse assembler never builds the dense matrix; the
+    dense callable serves dense mode and evaluation.  The indices must not
+    depend on the inputs: this is checked on two further random samples.
+    Padding entries (coordinates outside the shape) are dropped.
+
+    Args:
+        fn: The user callable, returning a 2-D ``BCOO``.
+        out: ``fn`` evaluated on a sample of ``v_in``.
+        v_in: The variables ``fn`` depends on, or ``None`` if constant.
+        nz: Non-zeros passed alongside ``fn``; must be ``None``.
+        what: Name used in error messages (e.g. ``"q_mat"``).
+
+    Returns:
+        The dense callable, the non-zeros, and ``out`` as a dense array.
+
+    Raises:
+        ValueError: If ``nz`` is also given, if ``out`` has batch or dense
+            dimensions, or if the indices change with the inputs.
+    """
+    if nz is not None:
+        raise ValueError(
+            f"{what} returns a BCOO, which already defines its non-zeros; "
+            f"do not also pass {what}_nz."
+        )
+    if out.n_batch or out.n_dense:
+        raise ValueError(
+            f"{what} must return a BCOO without batch or dense dimensions, got "
+            f"n_batch={out.n_batch}, n_dense={out.n_dense}."
+        )
+
+    idx = np.asarray(out.indices)
+    for _ in range(2 if v_in else 0):
+        other = fn(make_sample(v_in))
+        if not (isinstance(other, BCOO)
+                and np.array_equal(np.asarray(other.indices), idx)):
+            raise ValueError(
+                f"The BCOO indices returned by {what} change with its inputs. "
+                f"They must be static: build them from constants (e.g. NumPy "
+                f"arrays), not from the input values."
+            )
+
+    rows, cols = idx[:, 0], idx[:, 1]
+    keep = (rows < out.shape[0]) & (cols < out.shape[1])
+    if keep.all():
+        vals = lambda v: fn(v).data
+    else:
+        rows, cols = rows[keep], cols[keep]
+        vals = lambda v: fn(v).data[keep]
+
+    return (lambda v: fn(v).todense()), NonZeros(rows, cols, vals), out.todense()
