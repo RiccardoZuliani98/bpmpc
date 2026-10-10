@@ -1,17 +1,23 @@
-"""Sparse QP assembly via random probing and XLA-fused BCOO indexing.
+"""Sparse QP assembly via coordinate lists and XLA-fused BCOO indexing.
 
 This module implements the sparse equivalent to the dense QP assembler.
-Rather than allocating full dense matrices for the QP solver, it analyzes 
-the structural sparsity of the MPC problem at build time. 
+Rather than allocating full dense matrices for the QP solver, it collects
+the structural non-zeros of the MPC problem at build time.
 
-It accomplishes this via **random probing**: evaluating the user-defined 
-cost and constraint functions with dummy random inputs to discover which 
-matrix entries are non-zero. It then compiles a static `jax.experimental.sparse.BCOO` 
-sparsity pattern. At runtime (inside JIT), the `apply` method rapidly 
-updates these specific non-zero slices without rebuilding the sparsity graph.
+Every matrix term contributes a :class:`~bpmpc.mpc._src.types.NonZeros`:
+static coordinates plus a callable producing the values at them.  Terms
+built by the helpers declare theirs, so their dense matrix is never built.
+For any other term the pattern is found by **random probing**: evaluating
+the dense callable with dummy random inputs and keeping the entries that
+are non-zero.  Slack coefficients are constant coordinate lists as well.
+
+The coordinates are appended, in a fixed order, into one static
+`jax.experimental.sparse.BCOO` pattern per matrix, each term owning a
+contiguous slice of its data.  At runtime (inside JIT), the `apply`
+method overwrites those slices without rebuilding the sparsity graph.
 """
 
-from typing import List, Dict, Tuple, Union, Any, Sequence
+from typing import List, Dict, Union, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -19,8 +25,8 @@ import numpy as np
 from jax.experimental import sparse
 from collections import defaultdict
 
-from bpmpc.mpc._src.types import QPData
-from bpmpc.mpc._src.terms import field_of, _CostTerm, _CstTerm
+from bpmpc.mpc._src.types import QPData, NonZeros
+from bpmpc.mpc._src.terms import field_of, decompose_slacks, _CostTerm, _CstTerm
 from bpmpc.mpc._src.constraint import Constraint
 
 class SparseAssembler:
@@ -35,8 +41,8 @@ class SparseAssembler:
     shapes : dict
         The global dense shapes of the QP fields (P, q, A, b, G, h, c).
     matrix_metadata : dict
-        Stores the static BCOO `indices`, the 1D data sizes, and the exact 
-        slice objects that dictate where each parametric term writes its non-zeros.
+        Stores the static BCOO `indices`, the 1D data sizes, and for each
+        parametric term the `slice` of the data it owns and its value callable.
     base_qp : QPData
         The statically compiled QP structure containing all constant terms, 
         slack penalties, and the static BCOO sparsity indices.
@@ -71,98 +77,9 @@ class SparseAssembler:
         for t in slow_terms:  self.terms_by_field[field_of(t)]['slow'].append(t)
         for t in fast_terms:  self.terms_by_field[field_of(t)]['fast'].append(t)
         
-        # ------------------------------------------------------------------
-        # Extract Slack Structure
-        # ------------------------------------------------------------------
-        # Slacks only contribute linear/quadratic costs and constant -1.0 
-        # couplings in the G matrix. They are perfectly static.
-        n_slack = n_dec - n_var
-        
-        # slack_P_rows_old, slack_P_cols_old, slack_P_vals_old = [], [], []
-        # slack_G_rows_old, slack_G_cols_old, slack_G_vals_old = [], [], []
-        # q_slack_vec_old = np.zeros(n_slack)
-        
-        # if n_slack > 0:
-        #     col = row = 0
-        #     for cst in constraints:
-        #         if cst.is_equality: 
-        #             continue
-        #         if cst.slack and not cst.slack.is_empty:
-        #             s = cst.slack
-        #             # Extract Diagonal P_slack and dense q_slack
-        #             for i in range(s.n_slack):
-        #                 slack_P_rows_old.append(n_var + col + i)
-        #                 slack_P_cols_old.append(n_var + col + i)
-        #                 slack_P_vals_old.append(float(s.w_quad_array[i]))
-        #                 q_slack_vec_old[col + i] = float(s.w_lin_array[i])
-                        
-        #             # Extract G_slack coupling (-1.0 maps slack to inequalities)
-        #             for i, idx in enumerate(s.slack_indices):
-        #                 slack_G_rows_old.append(row + idx)
-        #                 slack_G_cols_old.append(n_var + col + i)
-        #                 slack_G_vals_old.append(-1.0)
-        #             col += s.n_slack
-        #         row += cst.n_cst
-                
-        #     # Extract non-negativity bounds for all slack variables (-s <= 0)
-        #     for i in range(n_slack):
-        #         slack_G_rows_old.append(n_ineq_user + i)
-        #         slack_G_cols_old.append(n_var + i)
-        #         slack_G_vals_old.append(-1.0)
-
-        slack_P_rows, slack_P_cols, slack_P_vals = [], [], []
-        slack_G_rows, slack_G_cols, slack_G_vals = [], [], []
-        q_slack_vec = np.zeros(n_slack)
-
-        if n_slack > 0:
-            col = row = 0
-            for cst in constraints:
-                if cst.is_equality: 
-                    continue
-                
-                if cst.slack and not cst.slack.is_empty:
-                    s = cst.slack
-                    n_s = s.n_slack
-                    
-                    # 1. Extract Diagonal P_slack and dense q_slack
-                    # Use range() directly to extend lists in bulk
-                    idx_range = range(n_var + col, n_var + col + n_s)
-                    slack_P_rows.extend(idx_range)
-                    slack_P_cols.extend(idx_range)
-
-                    # multiply by two to counteract the 0.5 imposed by the QP solver
-                    slack_P_vals.extend(2.0 * float(x) for x in s.w_quad_array[:n_s])
-                    
-                    # Use slice assignment for bulk updating the q_slack_vec
-                    q_slack_vec[col : col + n_s] = [float(x) for x in s.w_lin_array[:n_s]]
-                        
-                    # 2. Extract G_slack coupling (-1.0 maps slack to inequalities)
-                    num_idx = len(s.slack_indices)
-                    slack_G_rows.extend(row + idx for idx in s.slack_indices)
-                    slack_G_cols.extend(range(n_var + col, n_var + col + num_idx))
-                    
-                    # Multiply a single element list to bulk-create constant values
-                    slack_G_vals.extend([-1.0] * num_idx)
-                    
-                    col += n_s
-                
-                row += cst.n_cst
-                
-            # 3. Extract non-negativity bounds for all slack variables (-s <= 0)
-            slack_G_rows.extend(range(n_ineq_user, n_ineq_user + n_slack))
-            slack_G_cols.extend(range(n_var, n_var + n_slack))
-            slack_G_vals.extend([-1.0] * n_slack)
-
-        # --- ASSERTIONS ---
-        # assert slack_P_rows == slack_P_rows_old, "Mismatch in slack_P_rows"
-        # assert slack_P_cols == slack_P_cols_old, "Mismatch in slack_P_cols"
-        # assert slack_P_vals == slack_P_vals_old, "Mismatch in slack_P_vals"
-        
-        # assert slack_G_rows == slack_G_rows_old, "Mismatch in slack_G_rows"
-        # assert slack_G_cols == slack_G_cols_old, "Mismatch in slack_G_cols"
-        # assert slack_G_vals == slack_G_vals_old, "Mismatch in slack_G_vals"
-        
-        # assert np.allclose(q_slack_vec, q_slack_vec_old), "Mismatch in q_slack_vec"
+        # Slacks only contribute constant coordinate lists to P, q and G.
+        slack_P, slack_G, slack_q = decompose_slacks(constraints, n_var, n_ineq_user)
+        slack_coo = {'P': slack_P, 'G': slack_G}
 
         # ------------------------------------------------------------------
         # Build Matrix Structures (P, A, G)
@@ -171,70 +88,53 @@ class SparseAssembler:
         base_qp_kwargs = {}
         
         for field in ['P', 'A', 'G']:
-            all_rows, all_cols = [], []
+            # Each entry appends global coordinates and their constant values
+            # (zeros for parametric terms, filled in by apply()).
+            all_rows, all_cols, all_data = [], [], []
             current_idx = 0
             term_slices = {}
             
-            # 1. Process terms in a strictly deterministic order.
-            # We record a `slice` for each term, reserving a fixed block of 
-            # 1D memory in the BCOO data array for that term's non-zeros.
+            # 1. Process terms in a strictly deterministic order, reserving a
+            # contiguous slice of the BCOO data array for each term.
             for category in ['const', 'slow', 'fast']:
                 for term in self.terms_by_field[field][category]:
-                    r, c = probe_term(term)
-                    nnz = len(r)
+                    nz = term.nz if term.nz is not None else probe_term(term)
+                    nnz = len(nz.rows)
                     
                     term_slices[term.uid] = {
                         'slice': slice(current_idx, current_idx + nnz),
-                        # Store local rows relative to the term's output shape for fast slicing during apply()
-                        'rows': r - (term.row_start if isinstance(term, _CstTerm) else 0), 
-                        'cols': c
+                        'vals': nz.vals,
                     }
-                    all_rows.append(r)
-                    all_cols.append(c)
+                    all_rows.append(nz.rows + _row_offset(term))
+                    all_cols.append(nz.cols)
+                    all_data.append(
+                        np.asarray(nz.vals({})) if category == 'const' else np.zeros(nnz)
+                    )
                     current_idx += nnz
             
-            # 2. Append statically extracted slack indices to the end of the array.
-            if field == 'P' and slack_P_rows:
-                all_rows.append(np.array(slack_P_rows))
-                all_cols.append(np.array(slack_P_cols))
-                slack_nnz = len(slack_P_rows)
-                slack_slice = slice(current_idx, current_idx + slack_nnz)
-                current_idx += slack_nnz
-            elif field == 'G' and slack_G_rows:
-                all_rows.append(np.array(slack_G_rows))
-                all_cols.append(np.array(slack_G_cols))
-                slack_nnz = len(slack_G_rows)
-                slack_slice = slice(current_idx, current_idx + slack_nnz)
-                current_idx += slack_nnz
-            else:
-                slack_slice = None
+            # 2. Append the constant slack coefficients at the end of the array.
+            if field in slack_coo:
+                rows, cols, vals = slack_coo[field]
+                all_rows.append(rows)
+                all_cols.append(cols)
+                all_data.append(vals)
+                current_idx += len(rows)
 
             # 3. Concatenate all indices into a single (Total_NNZ, 2) XLA-compatible array.
             if all_rows:
                 global_r = np.concatenate(all_rows)
                 global_c = np.concatenate(all_cols)
                 indices = jnp.array(np.stack([global_r, global_c], axis=1), dtype=jnp.int32)
+                data = np.concatenate(all_data).astype(np.float64)
             else:
                 indices = jnp.empty((0, 2), dtype=jnp.int32)
+                data = np.zeros(0, dtype=np.float64)
                 
             self.matrix_metadata[field] = {
                 'indices': indices,
                 'term_slices': term_slices,
                 'total_nnz': current_idx
             }
-            
-            # 4. Populate the base_qp data with constant evaluations.
-            data = np.zeros(current_idx, dtype=np.float64)
-            for term in self.terms_by_field[field]['const']:
-                out = term.fn({}) 
-                meta = term_slices[term.uid]
-                data[meta['slice']] = out[meta['rows'], meta['cols']]
-                
-            # 5. Burn slack coefficients into the constant base data permanently.
-            if field == 'P' and slack_slice:
-                data[slack_slice] = slack_P_vals
-            elif field == 'G' and slack_slice:
-                data[slack_slice] = slack_G_vals
 
             # Create the frozen BCOO construct.
             base_qp_kwargs[field] = sparse.BCOO(
@@ -261,8 +161,8 @@ class SparseAssembler:
                     val[term.row_start : term.row_end] += out
                     
             # Burn slack linear penalties into the bottom block of q.
-            if field == 'q' and n_slack > 0:
-                val[n_var : n_dec] += q_slack_vec
+            if field == 'q':
+                val[n_var : n_dec] += slack_q
                 
             base_qp_kwargs[field] = jnp.array(val)
             
@@ -314,12 +214,8 @@ class SparseAssembler:
             
             for term in terms_by_field[field]:
                 t_meta = meta['term_slices'][term.uid]
-                out = term.fn(vars)
-                
-                # Extract the specific non-zeros produced by this term...
-                nnz_vals = out[t_meta['rows'], t_meta['cols']]
-                # ...and overwrite its dedicated 1D slice in the BCOO data array.
-                new_data = new_data.at[t_meta['slice']].set(nnz_vals)
+                # Overwrite this term's dedicated 1D slice in the BCOO data array.
+                new_data = new_data.at[t_meta['slice']].set(t_meta['vals'](vars))
                 
             # Re-package the updated 1D data with the original static indices.
             updates[field] = sparse.BCOO(
@@ -381,23 +277,33 @@ def build(
 # Internal
 # ======================================================================
 
+def _row_offset(term: Union[_CostTerm, _CstTerm]) -> int:
+    """Global row of a term's local row 0.
+
+    Cost terms sit in the top-left ``[n_var, n_var]`` block of P; constraint
+    terms are shifted down to their slice of the global constraint matrix.
+    """
+    return term.row_start if isinstance(term, _CstTerm) else 0
+
+
 def probe_term(
     term: Union[_CostTerm, _CstTerm], 
     num_probes: int = 3, 
     key_seed: int = 42, 
     tol: float = 1e-10
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Evaluates a term with random inputs to find structural non-zeros.
+) -> NonZeros:
+    """Evaluates a matrix term with random inputs to find structural non-zeros.
 
-    By evaluating the term multiple times with normally distributed random 
-    inputs, we can reliably identify structurally non-zero elements while 
-    avoiding "accidental zeros" that might occur with a single evaluation.
+    Fallback for terms that do not declare their non-zeros. By evaluating
+    the term multiple times with normally distributed random inputs, we can
+    reliably identify structurally non-zero elements while avoiding
+    "accidental zeros" that might occur with a single evaluation.
     This must be run statically at build time (outside of JIT).
 
     Parameters
     ----------
     term : _CostTerm or _CstTerm
-        The term to probe.
+        The matrix term to probe.
     num_probes : int, optional
         Number of random evaluations to perform (default is 3).
     key_seed : int, optional
@@ -407,9 +313,9 @@ def probe_term(
 
     Returns
     -------
-    tuple of (np.ndarray, np.ndarray)
-        The global `(row_indices, col_indices)` where this term contributes 
-        non-zeros to the QP matrices.
+    NonZeros
+        The term-local coordinates of the non-zeros, with a value callable
+        that gathers them from the dense output of ``term.fn``.
     """
     key = jax.random.PRNGKey(key_seed)
     accum_mask = None
@@ -429,19 +335,6 @@ def probe_term(
         else:
             accum_mask = accum_mask | current_mask
             
-    accum_mask_np = np.array(accum_mask)
-    
-    # Extract 2D local indices
-    if accum_mask_np.ndim == 2:
-        local_rows, local_cols = np.nonzero(accum_mask_np)
-    else:
-        local_rows = np.nonzero(accum_mask_np)[0]
-        local_cols = np.zeros_like(local_rows)
-        
-    # Map local structural indices to the global QP coordinates.
-    # Cost terms sit in the top-left [n_var, n_var] block of P.
-    # Constraint terms span [n_cst, n_var] and must be shifted by their global row.
-    if isinstance(term, _CostTerm):
-        return local_rows, local_cols
-    else:
-        return local_rows + term.row_start, local_cols
+    rows, cols = np.nonzero(np.array(accum_mask))
+    fn = term.fn
+    return NonZeros(rows, cols, lambda v: fn(v)[rows, cols])

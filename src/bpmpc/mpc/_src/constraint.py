@@ -18,7 +18,7 @@ from jax import Array
 
 from bpmpc.variable             import Variable
 from bpmpc.mpc._src.slack       import SlackSpec
-from bpmpc.mpc._src.types       import ArrayIn
+from bpmpc.mpc._src.types       import ArrayIn, NonZeros
 from bpmpc.mpc._src.validation  import validate_shared_variables, make_sample, merge_v_in
 from bpmpc.mpc._src.partition   import Partition
 
@@ -45,6 +45,10 @@ class Constraint:
         Description of each constraint using the "Partition" class.
     var_partition : Optional[Partition], default None
         Description of each variable using the "Partition" class.
+    lhs_nz : Optional[NonZeros], default None
+        Optional coordinate description of ``lhs``'s non-zeros.  When given,
+        the sparse assembler writes only these entries instead of
+        materialising the dense ``(n_cst, n_var)`` matrix.
 
     Attributes
     ----------
@@ -84,6 +88,7 @@ class Constraint:
     cst_partition:  Optional[Partition]
     var_partition:  Optional[Partition]
     name:           Optional[str]
+    lhs_nz:         Optional[NonZeros]
 
     def __init__(
         self,
@@ -95,7 +100,8 @@ class Constraint:
         slack:          Optional[SlackSpec] = None,
         cst_partition:  Optional[Partition] = None,
         var_partition:  Optional[Partition] = None,
-        name:           Optional[str] = None
+        name:           Optional[str] = None,
+        lhs_nz:         Optional[NonZeros] = None,
     ) -> None:
         self.cst_type = cst_type
         self.v_in_lhs = v_in_lhs
@@ -116,9 +122,14 @@ class Constraint:
             _rhs_arr = jnp.asarray(rhs)
             self._rhs = lambda _: _rhs_arr
 
-        lhs_num = self._lhs(make_sample(v_in_lhs))
+        lhs_sample = make_sample(v_in_lhs)
+        lhs_num = self._lhs(lhs_sample)
         rhs_num = self._rhs(make_sample(v_in_rhs))
         self._validate_shapes(lhs_num, rhs_num)
+
+        if lhs_nz is not None:
+            lhs_nz.check(lhs_num.shape, lhs_sample, "lhs_nz")
+        self.lhs_nz = lhs_nz
 
         self.n_cst = lhs_num.shape[0]
         self.n_var = lhs_num.shape[1]
@@ -251,7 +262,8 @@ class Constraint:
             slack=new_slack,
             var_partition=self.var_partition,
             cst_partition=self.cst_partition,
-            name=self.name
+            name=self.name,
+            lhs_nz=self.lhs_nz,
         )
 
     # ------------------------------------------------------------------
@@ -338,6 +350,12 @@ class Constraint:
         lhs_a, lhs_b = self._lhs, other._lhs
         rhs_a, rhs_b = self._rhs, other._rhs
 
+        # Stacking appends the lower block's non-zeros, shifted down by this
+        # constraint's height.  Only available when both halves carry them.
+        merged_nz = None
+        if self.lhs_nz is not None and other.lhs_nz is not None:
+            merged_nz = self.lhs_nz.append(other.lhs_nz, row_shift=self.n_cst)
+
         names = set((elem for elem in [self.name, other.name] if elem is not None))
 
         if len(names) == 1: 
@@ -356,7 +374,8 @@ class Constraint:
             slack=merged_slack,
             cst_partition=merged_cst_partition,
             var_partition=merged_var_partition,
-            name=name
+            name=name,
+            lhs_nz=merged_nz,
         )
 
     def __add__(self, other: "Constraint") -> "Constraint":

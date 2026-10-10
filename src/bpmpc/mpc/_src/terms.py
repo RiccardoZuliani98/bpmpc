@@ -19,12 +19,13 @@ from typing import (
     Optional, Sequence, Tuple, TypeVar,
 )
 
+import numpy as np
 from jax import Array
 
 from bpmpc.variable            import Variable
 from bpmpc.mpc._src.cost       import Cost
 from bpmpc.mpc._src.constraint import Constraint
-from bpmpc.mpc._src.types      import ArrayIn
+from bpmpc.mpc._src.types      import ArrayIn, NonZeros
 
 
 # ======================================================================
@@ -44,16 +45,20 @@ class _CostTerm(NamedTuple):
         A dictionary of Variables required by `fn`, or `None` if the term is constant.
     uid : str
         A unique identifier auto-generated upon instantiation.
+    nz : Optional[NonZeros]
+        Optional non-zeros of `fn`'s output, letting the sparse assembler
+        skip the dense matrix. `None` means the pattern must be probed.
     """
     target: Literal["P", "q", "c"]
     fn:     Callable[[ArrayIn], Array]
     v_in:   Optional[Dict[str, Variable]]
     uid:    str
+    nz:     Optional[NonZeros] = None
 
     @classmethod
-    def create(cls, target, fn, v_in):
+    def create(cls, target, fn, v_in, nz=None):
         """Factory method to auto-generate a UUID on instantiation."""
-        return cls(target, fn, v_in, uid=uuid.uuid4().hex)
+        return cls(target, fn, v_in, uid=uuid.uuid4().hex, nz=nz)
 
 
 class _CstTerm(NamedTuple):
@@ -75,6 +80,10 @@ class _CstTerm(NamedTuple):
         A dictionary of Variables required by `fn`, or `None` if the term is constant.
     uid : str
         A unique identifier auto-generated upon instantiation.
+    nz : Optional[NonZeros]
+        Optional non-zeros of `fn`'s output, with rows local to this term
+        (not yet shifted by `row_start`). `None` means the pattern must be
+        probed.
     """
     target:    Literal["lhs", "rhs"]
     cst_kind:  Literal["eq", "ineq"]
@@ -83,11 +92,13 @@ class _CstTerm(NamedTuple):
     fn:        Callable[[ArrayIn], Array]
     v_in:      Optional[Dict[str, Variable]]
     uid:       str
+    nz:        Optional[NonZeros] = None
 
     @classmethod
-    def create(cls, target, cst_kind, row_start, row_end, fn, v_in):
+    def create(cls, target, cst_kind, row_start, row_end, fn, v_in, nz=None):
         """Factory method to auto-generate a UUID on instantiation."""
-        return cls(target, cst_kind, row_start, row_end, fn, v_in, uid=uuid.uuid4().hex)
+        return cls(target, cst_kind, row_start, row_end, fn, v_in,
+                   uid=uuid.uuid4().hex, nz=nz)
 
 
 Term = _CostTerm | _CstTerm
@@ -138,7 +149,7 @@ def decompose_costs(costs: Sequence[Cost]) -> List[_CostTerm]:
     """
     terms: List[_CostTerm] = []
     for cost in costs:
-        terms.append(_CostTerm.create("P", cost._q_mat, cost.v_in_q_mat))
+        terms.append(_CostTerm.create("P", cost._q_mat, cost.v_in_q_mat, nz=cost.q_mat_nz))
         terms.append(_CostTerm.create("q", cost._q_vec, cost.v_in_q_vec))
         terms.append(_CostTerm.create("c", cost._c,     cost.v_in_c))
     return terms
@@ -175,9 +186,65 @@ def decompose_constraints(
             rs = ineq_row
             ineq_row += cst.n_cst
         re = rs + cst.n_cst
-        terms.append(_CstTerm.create("lhs", kind, rs, re, cst._lhs, cst.v_in_lhs))
+        terms.append(_CstTerm.create("lhs", kind, rs, re, cst._lhs, cst.v_in_lhs, nz=cst.lhs_nz))
         terms.append(_CstTerm.create("rhs", kind, rs, re, cst._rhs, cst.v_in_rhs))
     return terms
+
+
+Coo = Tuple[np.ndarray, np.ndarray, np.ndarray]
+
+
+def decompose_slacks(
+    constraints: Sequence[Constraint],
+    n_var:       int,
+    n_ineq_user: int,
+) -> Tuple[Coo, Coo, np.ndarray]:
+    """Coordinates and values of the constant slack contributions.
+
+    Slack ``j`` lives in decision column ``n_var + j``.  It adds its
+    quadratic weight on the diagonal of ``P``, its linear weight to ``q``,
+    a ``-1`` in ``G`` on the inequality row it relaxes, and a ``-1`` in
+    ``G`` on its own non-negativity row ``n_ineq_user + j``.
+
+    Parameters
+    ----------
+    constraints : Sequence[Constraint]
+        The constraints to scan for slack definitions.
+    n_var : int
+        The number of decision variables before the slacks.
+    n_ineq_user : int
+        The number of user inequality rows; non-negativity rows follow.
+
+    Returns
+    -------
+    P : (rows, cols, vals)
+        Global coordinates and values of the slack diagonal of ``P``.
+    G : (rows, cols, vals)
+        Global coordinates and values of the slack columns of ``G``.
+    q : np.ndarray
+        Linear weights of shape ``(n_slack,)``, for ``q[n_var:]``.
+    """
+    g_rows, w_quad, w_lin = [], [], []
+    row = 0
+    for cst in constraints:
+        if cst.is_equality:
+            continue
+        if cst.is_slacked:
+            g_rows.extend(row + i for i in cst.slack.slack_indices)
+            w_quad.extend(cst.slack.w_quad)
+            w_lin.extend(cst.slack.w_lin)
+        row += cst.n_cst
+
+    n_slack = len(g_rows)
+    cols = n_var + np.arange(n_slack)
+    # Multiply by two to counteract the 0.5 imposed by the QP solver.
+    P = (cols, cols, 2.0 * np.asarray(w_quad, dtype=float))
+    G = (
+        np.concatenate([np.asarray(g_rows, dtype=int), n_ineq_user + np.arange(n_slack)]),
+        np.concatenate([cols, cols]),
+        -np.ones(2 * n_slack),
+    )
+    return P, G, np.asarray(w_lin, dtype=float)
 
 
 # ======================================================================

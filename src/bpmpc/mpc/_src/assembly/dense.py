@@ -25,7 +25,7 @@ from jax import Array
 import jax.numpy as jnp
 
 from bpmpc.mpc._src.types import QPData
-from bpmpc.mpc._src.terms import _CostTerm, Term
+from bpmpc.mpc._src.terms import _CostTerm, Term, decompose_slacks
 from bpmpc.mpc._src.constraint import Constraint
 from bpmpc.mpc._src.types import ArrayIn
 
@@ -157,16 +157,14 @@ def build(
     for t in const_terms:
         qp = _add(qp, t, t.fn({}))
 
-    # 3. Build and fold slacks.
-    # We delegate this to a dense-specific helper to keep problem.py clean 
-    # and avoid "dense leaks" in sparse mode.
-    n_slack = n_dec - n_var
-    if n_slack > 0:
-        P_s, q_s, G_s = _build_slack_dense(constraints, n_ineq_user, n_slack)
+    # 3. Fold slacks.  Their columns are untouched by the terms above, so
+    # scattering the shared coordinate lists in is enough.
+    if n_dec > n_var:
+        (Pr, Pc, Pv), (Gr, Gc, Gv), q_s = decompose_slacks(constraints, n_var, n_ineq_user)
         qp = qp._replace(
-            P=qp.P.at[-n_slack:, -n_slack:].set(P_s),
-            q=qp.q.at[-n_slack:].set(q_s),
-            G=qp.G.at[:, -n_slack:].set(G_s),
+            P=qp.P.at[Pr, Pc].add(Pv),
+            q=qp.q.at[n_var:].add(q_s),
+            G=qp.G.at[Gr, Gc].add(Gv),
         )
 
     return DenseAssembler(
@@ -234,61 +232,3 @@ def _add(qp: QPData, term: Term, val: Array) -> QPData:
         # Target the specific row block, but only the base variable columns.
         return qp._replace(G=qp.G.at[rs:re, :val.shape[1]].add(val))
     return qp._replace(h=qp.h.at[rs:re].add(val))
-
-
-def _build_slack_dense(
-    constraints: Sequence[Constraint], 
-    n_ineq_user: int, 
-    n_slack:     int
-) -> Tuple[Array, Array, Array]:
-    """Constructs the dense blocks for slack variable penalties and coupling.
-
-    This function computes the trailing columns of the inequality matrix G 
-    and the trailing diagonal/vector of the cost function that correspond 
-    to the soft-constraint slack variables.
-
-    Parameters
-    ----------
-    constraints : Sequence[Constraint]
-        The list of constraints to scan for slack definitions.
-    n_ineq_user : int
-        The row offset where user inequalities end and slack non-negativity starts.
-    n_slack : int
-        The total number of slack variables.
-
-    Returns
-    -------
-    P_slack : Array
-        A diagonal matrix of quadratic slack weights.
-    q_slack : Array
-        A vector of linear slack weights.
-    G_slack : Array
-        The matrix coupling slacks to user inequalities and non-negativity bounds.
-    """
-    P_diag = jnp.zeros(n_slack)
-    q_vec  = jnp.zeros(n_slack)
-    # G has one row per user inequality plus one per slack (for s >= 0).
-    G_cols = jnp.zeros((n_ineq_user + n_slack, n_slack))
-    
-    col = row = 0
-    for cst in constraints:
-        if cst.is_equality: 
-            continue
-            
-        if cst.slack and not cst.slack.is_empty:
-            s = cst.slack
-            # multiply by two to counteract the 0.5 imposed by the QP solver
-            P_diag = P_diag.at[col:col+s.n_slack].set(2.0 * s.w_quad_array)
-            q_vec  = q_vec.at[col:col+s.n_slack].set(s.w_lin_array)
-            
-            # Map the slack variable to its specific inequality row
-            for idx in s.slack_indices:
-                G_cols = G_cols.at[row + idx, col].set(-1.0)
-                col += 1
-        row += cst.n_cst
-    
-    # Non-negativity coupling block: Ensures slacks remain positive (s >= 0)
-    # in the standard form Gx <= h.
-    G_cols = G_cols.at[n_ineq_user:, :].set(-jnp.eye(n_slack))
-    
-    return jnp.diag(P_diag), q_vec, G_cols
