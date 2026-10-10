@@ -58,7 +58,7 @@ N_INEQ = 2 * (N * NX + N * NU)
 class TestLTIDynamics:
 
     def test_lti_builder(self):
-        lhs = build_lti_lhs(A_LTI, B_LTI, N)
+        lhs = build_lti_lhs(A_LTI, B_LTI, N).todense()
         assert lhs.shape == (N_EQ, N_VAR)
         
         # Verify block structure
@@ -310,7 +310,7 @@ class TestBoxBounds:
             jnp.tile(jnp.isfinite(U_MAX), N),
             jnp.tile(jnp.isfinite(u_min), N),
         ])
-        expected_lhs = build_box_lhs(NX, NU, N)[keep]
+        expected_lhs = build_box_lhs(NX, NU, N).todense()[keep]
         expected_rhs = build_box_rhs(X_MIN, x_max, u_min, U_MAX, N)[keep]
 
         assert jnp.array_equal(bounds.eval_lhs({}), expected_lhs)
@@ -412,6 +412,7 @@ class TestCosts:
         ru = jnp.zeros((N, NU))
 
         P, q, c = build_state_tracking(Q_seq, R_seq, rx, ru, X0_VAL, N)
+        P = P.todense()
 
         assert P.shape == (N_VAR, N_VAR)
         assert q.shape == (N_VAR,)
@@ -562,7 +563,7 @@ class TestCosts:
         ru = jnp.array(rng.normal(size=(N, NU)))
 
         P, q, c = build_state_tracking(Q_x, R_u, rx, ru, X0_VAL, N)
-        assert jnp.array_equal(P, build_state_tracking_mat(Q_x, R_u, N))
+        assert jnp.array_equal(P.todense(), build_state_tracking_mat(Q_x, R_u, N).todense())
         assert jnp.array_equal(q, build_state_tracking_vec(Q_x, R_u, rx, ru, N))
         assert jnp.array_equal(
             c, build_state_tracking_const(Q_x, R_u, rx, ru, X0_VAL, N)
@@ -574,7 +575,9 @@ class TestCosts:
         Q_y = jnp.array(rng.normal(size=(N + 1, NY, NY)))
 
         P, q, c = build_output_tracking(C_seq, D_seq, r_seq, Q_y, X0_VAL, N)
-        assert jnp.array_equal(P, build_output_tracking_mat(C_seq, D_seq, Q_y, N))
+        assert jnp.array_equal(
+            P.todense(), build_output_tracking_mat(C_seq, D_seq, Q_y, N).todense()
+        )
         assert jnp.array_equal(
             q, build_output_tracking_vec(C_seq, D_seq, r_seq, Q_y, X0_VAL, N)
         )
@@ -797,3 +800,59 @@ class TestHelperIntegration:
         
         raw_violation = (lhs_x @ z_primal) - rhs_x
         assert jnp.any(raw_violation > 1e-4), "State was mathematically feasible without slacks! (x0 wasn't infeasible enough)"
+
+# ======================================================================
+# Sparse builder mode
+# ======================================================================
+
+class TestSparseBuilders:
+    """Matrix builders return a BCOO by default, equal to the ``sparse=False`` array."""
+
+    @staticmethod
+    def _cases():
+        NY = 3
+        rng = np.random.default_rng(11)
+        Q_x = jnp.array(rng.normal(size=(N + 1, NX, NX)))
+        R_u = jnp.array(rng.normal(size=(N, NU, NU)))
+        C_seq = jnp.array(rng.normal(size=(N + 1, NY, NX)))
+        D_seq = jnp.array(rng.normal(size=(N, NY, NU)))
+        Q_y = jnp.array(rng.normal(size=(N + 1, NY, NY)))
+        rx, ru = jnp.zeros((N + 1, NX)), jnp.zeros((N, NU))
+        r_y = jnp.zeros((N + 1, NY))
+        return {
+            "lti_lhs": lambda **kw: build_lti_lhs(A_LTI, B_LTI, N, **kw),
+            "ltv_lhs": lambda **kw: build_ltv_lhs(A_LTV, B_LTV, N, **kw),
+            "box_lhs": lambda **kw: build_box_lhs(NX, NU, N, **kw),
+            "state_P": lambda **kw: build_state_tracking(
+                Q_x, R_u, rx, ru, X0_VAL, N, **kw)[0],
+            "output_P": lambda **kw: build_output_tracking(
+                C_seq, D_seq, r_y, Q_y, X0_VAL, N, **kw)[0],
+        }
+
+    @pytest.mark.parametrize("name", ["lti_lhs", "ltv_lhs", "box_lhs", "state_P", "output_P"])
+    def test_sparse_matches_dense(self, name):
+        from jax.experimental.sparse import BCOO
+        build = self._cases()[name]
+        dense, sparse = build(sparse=False), build()
+        assert not isinstance(dense, BCOO)
+        assert isinstance(sparse, BCOO)
+        np.testing.assert_array_equal(np.asarray(sparse.todense()), np.asarray(dense))
+
+    def test_sparse_builder_inside_parametric_cost(self):
+        """A lambda returning the sparse builder output gives the same QP matrix."""
+        from bpmpc.mpc import Cost
+        v_R = Variable("R", (NU, NU))
+        Q_x = jnp.broadcast_to(jnp.eye(NX), (N + 1, NX, NX))
+
+        def make(sparse):
+            def q_mat(v):
+                R = jnp.broadcast_to(v["R"], (N, NU, NU))
+                return build_state_tracking(
+                    Q_x, R, jnp.zeros((N + 1, NX)), jnp.zeros((N, NU)),
+                    X0_VAL, N, sparse=sparse)[0]
+            return Cost(q_mat=q_mat, v_in_q_mat={"R": v_R})
+
+        sparse, dense = make(True), make(False)
+        assert sparse._q_mat_nz is not None
+        v = {"R": 3.0 * jnp.eye(NU)}
+        np.testing.assert_allclose(sparse.eval_q_mat(v), dense.eval_q_mat(v))

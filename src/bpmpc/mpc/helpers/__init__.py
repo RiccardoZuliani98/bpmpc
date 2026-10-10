@@ -4,7 +4,10 @@
 Arguments accept ``Array`` (constant) or ``Variable`` (parametric).
 
 **Builders** are pure functions that take concrete arrays and return
-dense matrices.  Useful for custom parametric logic inside a lambda.
+matrices.  Useful for custom parametric logic inside a lambda.  Matrix
+builders return a ``BCOO`` with static indices by default, which a
+``Cost`` / ``Constraint`` uses as its sparsity pattern directly; pass
+``sparse=False`` to get a dense array.
 
 Usage::
 

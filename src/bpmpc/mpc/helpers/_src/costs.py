@@ -3,7 +3,8 @@
 Two layers:
 
 1. **Builders** (``build_*``) — pure functions that take concrete
-   arrays and return ``(P, q, c)`` tuples.
+   arrays and return ``(P, q, c)`` tuples.  ``P`` is a ``BCOO`` with
+   static indices by default, or dense when ``sparse=False``.
 
 2. **Factories** (``state_tracking_cost``, ``output_tracking_cost``)
    — accept ``Array | Variable`` per argument and return a
@@ -18,7 +19,7 @@ where ``x_0`` is a parameter, not a decision variable.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple, Sequence
+from typing import Dict, Optional, Tuple, Sequence, Union
 
 import numpy as np
 import jax.numpy as jnp
@@ -48,13 +49,16 @@ def _decision_indices(n_x: int, n_u: int, horizon: int) -> Tuple[np.ndarray, np.
     return x_idx, u_idx, n_x_total + N * n_u
 
 
-def build_state_tracking_mat(Q: Array, R: Array, horizon: int) -> Array:
+def build_state_tracking_mat(
+    Q: Array, R: Array, horizon: int, *, sparse: bool = True,
+) -> Union[Array, BCOO]:
     """Build only ``P`` for the state/input tracking cost.
 
     See :func:`build_state_tracking`.  Split out so callers that need the
     quadratic term alone do not trace the reference-dependent work.
     """
-    return _state_tracking_mat_bcoo(Q, R, horizon).todense()
+    P = _state_tracking_mat_bcoo(Q, R, horizon)
+    return P if sparse else P.todense()
 
 
 def _state_tracking_mat_bcoo(Q: Array, R: Array, horizon: int) -> BCOO:
@@ -115,7 +119,8 @@ def build_state_tracking(
     Q: Array, R: Array,
     r_x: Array, r_u: Array,
     x0: Array, horizon: int,
-) -> Tuple[Array, Array, Array]:
+    *, sparse: bool = True,
+) -> Tuple[Union[Array, BCOO], Array, Array]:
     """Build ``(P, q, c)`` for state/input tracking cost.
 
     Cost::
@@ -133,6 +138,9 @@ def build_state_tracking(
     r_u : ``(N, n_u)`` input references.
     x0  : ``(n_x,)`` initial state.
     horizon : N.
+    sparse : if True (default), return ``P`` as a ``BCOO`` with static
+        indices, so a ``Cost`` built from it skips probing for the
+        sparsity pattern.  If False, return a dense array.
 
     Returns
     -------
@@ -141,7 +149,7 @@ def build_state_tracking(
     c : scalar
     """
     return (
-        build_state_tracking_mat(Q, R, horizon),
+        build_state_tracking_mat(Q, R, horizon, sparse=sparse),
         build_state_tracking_vec(Q, R, r_x, r_u, horizon),
         build_state_tracking_const(Q, R, r_x, r_u, x0, horizon),
     )
@@ -158,8 +166,8 @@ def _output_offsets(C: Array, r: Array, x0: Array) -> Array:
 
 
 def build_output_tracking_mat(
-    C: Array, D: Array, Q: Array, horizon: int,
-) -> Array:
+    C: Array, D: Array, Q: Array, horizon: int, *, sparse: bool = True,
+) -> Union[Array, BCOO]:
     """Build only ``P`` for the output tracking cost.
 
     The output map ``y = M z + d`` is block-sparse: block ``t`` touches only
@@ -168,7 +176,8 @@ def build_output_tracking_mat(
     four families of non-zero blocks are contracted directly, which is
     ``O(N)``.  See :func:`build_output_tracking`.
     """
-    return _output_tracking_mat_bcoo(C, D, Q, horizon).todense()
+    P = _output_tracking_mat_bcoo(C, D, Q, horizon)
+    return P if sparse else P.todense()
 
 
 def _output_tracking_mat_bcoo(C: Array, D: Array, Q: Array, horizon: int) -> BCOO:
@@ -242,7 +251,8 @@ def build_output_tracking(
     C: Array, D: Array,
     r: Array, Q: Array,
     x0: Array, horizon: int,
-) -> Tuple[Array, Array, Array]:
+    *, sparse: bool = True,
+) -> Tuple[Union[Array, BCOO], Array, Array]:
     """Build ``(P, q, c)`` for output tracking cost.
 
     Cost::
@@ -260,6 +270,8 @@ def build_output_tracking(
     Q  : ``(N+1, n_y, n_y)`` output weights.
     x0 : ``(n_x,)`` initial state.
     horizon : N.
+    sparse : return ``P`` as a ``BCOO`` (default) or dense; see
+        :func:`build_state_tracking`.
 
     Returns
     -------
@@ -268,7 +280,7 @@ def build_output_tracking(
     c : scalar
     """
     return (
-        build_output_tracking_mat(C, D, Q, horizon),
+        build_output_tracking_mat(C, D, Q, horizon, sparse=sparse),
         build_output_tracking_vec(C, D, r, Q, x0, horizon),
         build_output_tracking_const(C, r, Q, x0),
     )

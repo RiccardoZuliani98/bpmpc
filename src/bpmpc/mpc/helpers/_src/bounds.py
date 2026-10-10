@@ -3,7 +3,8 @@
 Two layers:
 
 1. **Builder** (``build_box_lhs``, ``build_box_rhs``) — pure functions
-   that take concrete arrays and return the dense matrices.
+   that take concrete arrays and return the matrices (the LHS is a
+   ``BCOO`` by default, or dense when ``sparse=False``).
 
 2. **Factory** (``box_bounds``) — accepts ``Array | Variable`` per
    argument and returns a ready-to-use :class:`Constraint`.
@@ -15,7 +16,7 @@ Decision vector layout::
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import jax.numpy as jnp
@@ -65,7 +66,9 @@ def _box_lhs_bcoo(
                 shape=(n_rows, horizon * (n_x + n_u)))
 
 
-def build_box_lhs(n_x: int, n_u: int, horizon: int) -> Array:
+def build_box_lhs(
+    n_x: int, n_u: int, horizon: int, *, sparse: bool = True,
+) -> Union[Array, BCOO]:
     """Build the constant LHS for box constraints.
 
     Returns ``(2*(N*n_x + N*n_u), N*n_x + N*n_u)`` matrix::
@@ -73,10 +76,12 @@ def build_box_lhs(n_x: int, n_u: int, horizon: int) -> Array:
         [ Fx; -Fx; Fu; -Fu ]
 
     where ``Fx = [I | 0]`` selects states and ``Fu = [0 | I]``
-    selects inputs.
+    selects inputs.  Returned as a ``BCOO`` with static indices, or as
+    a dense array when ``sparse=False``.
     """
     n_rows = 2 * horizon * (n_x + n_u)
-    return _box_lhs_bcoo(n_x, n_u, horizon, np.arange(n_rows)).todense()
+    lhs = _box_lhs_bcoo(n_x, n_u, horizon, np.arange(n_rows))
+    return lhs if sparse else lhs.todense()
 
 
 def build_box_rhs(

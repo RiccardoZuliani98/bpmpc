@@ -3,7 +3,8 @@
 Two layers:
 
 1. **Builders** (``build_*``) — pure functions that take concrete
-   arrays and return dense matrices.  Useful when the user needs
+   arrays and return matrices: the LHS is a ``BCOO`` with static
+   indices by default, or dense when ``sparse=False``.  Useful when the user needs
    custom parametric logic inside a ``Constraint`` lambda.
 
 2. **Factories** (``lti_dynamics``, ``ltv_dynamics``, ``nonlinear_dynamics``) — convenience
@@ -19,7 +20,7 @@ where ``x_0`` is a parameter, not a decision variable.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, Union
 
 import jax
 import jax.numpy as jnp
@@ -85,8 +86,10 @@ def _lhs_dtype(*arrs: Array) -> jnp.dtype:
 # LTI builders
 # ======================================================================
 
-def build_lti_lhs(A: Array, B: Array, horizon: int) -> Array:
-    """Build the dense equality LHS for time-invariant dynamics.
+def build_lti_lhs(
+    A: Array, B: Array, horizon: int, *, sparse: bool = True,
+) -> Union[Array, BCOO]:
+    """Build the equality LHS for time-invariant dynamics.
 
     Returns ``F`` of shape ``(N*n_x, N*n_x + N*n_u)`` such that
     ``F @ z = rhs`` encodes ``x_{k+1} = A x_k + B u_k + c``.
@@ -98,13 +101,15 @@ def build_lti_lhs(A: Array, B: Array, horizon: int) -> Array:
         F   = [F_x | F_u]
 
     where ``S`` is the sub-diagonal shift matrix.  Only the non-zero
-    blocks are formed (see :func:`_ltv_lhs_bcoo`), then densified.
+    blocks are formed (see :func:`_ltv_lhs_bcoo`) and returned as a
+    ``BCOO``, or densified when ``sparse=False``.
     """
     n_x, n_u = A.shape[0], B.shape[1]
     N = horizon
-    return _ltv_lhs_bcoo(
+    lhs = _ltv_lhs_bcoo(
         jnp.broadcast_to(A, (N, n_x, n_x)), jnp.broadcast_to(B, (N, n_x, n_u)), N,
-    ).todense()
+    )
+    return lhs if sparse else lhs.todense()
 
 
 def build_lti_rhs(
@@ -130,20 +135,25 @@ def build_lti_rhs(
 # LTV builders
 # ======================================================================
 
-def build_ltv_lhs(A: Array, B: Array, horizon: int) -> Array:
-    """Build the dense equality LHS for time-varying dynamics.
+def build_ltv_lhs(
+    A: Array, B: Array, horizon: int, *, sparse: bool = True,
+) -> Union[Array, BCOO]:
+    """Build the equality LHS for time-varying dynamics.
 
     Parameters
     ----------
     A : ``(N, n_x, n_x)`` — per-step state matrices.
     B : ``(N, n_x, n_u)`` — per-step input matrices.
     horizon : N
+    sparse : if True (default), return a ``BCOO`` with static indices;
+        if False, a dense array.
 
     Returns
     -------
-    ``(N*n_x, N*n_x + N*n_u)`` dense constraint matrix.
+    ``(N*n_x, N*n_x + N*n_u)`` constraint matrix.
     """
-    return _ltv_lhs_bcoo(A, B, horizon).todense()
+    lhs = _ltv_lhs_bcoo(A, B, horizon)
+    return lhs if sparse else lhs.todense()
 
 
 def build_ltv_rhs(
