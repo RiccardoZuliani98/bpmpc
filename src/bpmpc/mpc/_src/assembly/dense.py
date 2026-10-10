@@ -25,7 +25,7 @@ from jax import Array
 import jax.numpy as jnp
 
 from bpmpc.mpc._src.types import QPData
-from bpmpc.mpc._src.terms import _CostTerm, Term, decompose_slacks
+from bpmpc.mpc._src.terms import _CostTerm, _CstTerm, Term, decompose_slacks, field_of
 from bpmpc.mpc._src.constraint import Constraint
 from bpmpc.mpc._src.types import ArrayIn
 
@@ -98,7 +98,7 @@ class DenseAssembler(NamedTuple):
             A newly updated QPData object containing the accumulated terms.
         """
         for t in terms:
-            base = _add(base, t, t.fn(v))
+            base = _apply(base, t, v)
         return base
 
 
@@ -155,7 +155,7 @@ def build(
 
     # 2. Fold in all constant terms directly (eager evaluation).
     for t in const_terms:
-        qp = _add(qp, t, t.fn({}))
+        qp = _apply(qp, t, {})
 
     # 3. Fold slacks.  Their columns are untouched by the terms above, so
     # scattering the shared coordinate lists in is enough.
@@ -181,6 +181,23 @@ def build(
 # ======================================================================
 # Internal
 # ======================================================================
+
+def _apply(qp: QPData, term: Term, v: ArrayIn) -> QPData:
+    """Evaluates ``term`` at ``v`` and accumulates it into ``qp``.
+
+    A term with declared non-zeros (e.g. one returning a ``BCOO``) is
+    scatter-added entry by entry straight into its field.  Building its
+    dense block first and then adding it into a sub-block of the field
+    would cost a dense temporary of the block's size.
+    """
+    if term.nz is None:
+        return _add(qp, term, term.fn(v))
+    field = field_of(term)
+    rows = term.nz.rows + (term.row_start if isinstance(term, _CstTerm) else 0)
+    return qp._replace(**{
+        field: getattr(qp, field).at[rows, term.nz.cols].add(term.nz.vals(v))
+    })
+
 
 def _add(qp: QPData, term: Term, val: Array) -> QPData:
     """Adds the evaluated tensor ``val`` into the QPData field implied by ``term``.

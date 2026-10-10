@@ -31,8 +31,8 @@ class Cost:
     q_mat : Union[Array, BCOO, Callable[[ArrayIn], Union[Array, BCOO]]]
         Callable returning the symmetric quadratic matrix term, shape ``(n_var, n_var)``, or a constant array.
         It may return (or be) a ``BCOO`` whose indices do not depend on the
-        inputs; its non-zeros are then taken from the BCOO, exactly as if
-        ``q_mat_nz`` had been given.
+        inputs; the sparse assembler then writes only its stored entries
+        instead of materialising the dense ``(n_var, n_var)`` matrix.
     q_vec : Optional[Union[Array, Callable[[ArrayIn], Array]]], default None
         Callable returning the linear vector term, shape ``(n_var,)``, or a constant array.
     c : Optional[Union[Array, float, Callable[[ArrayIn], Array]]], default None
@@ -45,11 +45,6 @@ class Cost:
         Dictionary of variables required by the ``c`` callable, or ``None`` if constant.
     var_partition : Optional[Partition], default None
         Description of each variable using the "Partition" class.
-    q_mat_nz : Optional[NonZeros], default None
-        Optional coordinate description of ``q_mat``'s non-zeros.  When
-        given, the sparse assembler writes only these entries instead of
-        materialising the dense ``(n_var, n_var)`` matrix.  Not allowed when
-        ``q_mat`` returns a ``BCOO``.
 
     Attributes
     ----------
@@ -77,7 +72,7 @@ class Cost:
     v_in_c:         Optional[Dict[str, Variable]]
     n_var:          int
     var_partition:  Optional[Partition]
-    q_mat_nz:       Optional[NonZeros]
+    _q_mat_nz:      Optional[NonZeros]
 
     def __init__(
         self,
@@ -88,7 +83,6 @@ class Cost:
         v_in_q_vec:     Optional[Dict[str, Variable]] = None,
         v_in_c:         Optional[Dict[str, Variable]] = None,
         var_partition:  Optional[Partition] = None,
-        q_mat_nz:       Optional[NonZeros] = None,
     ) -> None:
         self.v_in_q_mat = v_in_q_mat
         self.v_in_q_vec = v_in_q_vec
@@ -113,11 +107,12 @@ class Cost:
             _q_mat_arr = jnp.asarray(q_mat)
             _q_mat_fn = lambda _: _q_mat_arr
 
-        q_mat_sample = make_sample(v_in_q_mat)
-        q_mat_num = _q_mat_fn(q_mat_sample)
+        # A BCOO output defines the non-zeros; ``_q_mat`` stays dense.
+        q_mat_num = _q_mat_fn(make_sample(v_in_q_mat))
+        self._q_mat_nz = None
         if isinstance(q_mat_num, BCOO):
-            _q_mat_fn, q_mat_nz, q_mat_num = split_bcoo(
-                _q_mat_fn, q_mat_num, v_in_q_mat, q_mat_nz, "q_mat")
+            _q_mat_fn, self._q_mat_nz, q_mat_num = split_bcoo(
+                _q_mat_fn, q_mat_num, v_in_q_mat, "q_mat")
         if q_mat_num.ndim != 2:
             raise ValueError(
                 f"q_mat must return a 2-D array, got ndim={q_mat_num.ndim}, "
@@ -129,10 +124,6 @@ class Cost:
         
         self.n_var = n_row
         self._q_mat = _q_mat_fn
-
-        if q_mat_nz is not None:
-            q_mat_nz.check(q_mat_num.shape, q_mat_sample, "q_mat_nz")
-        self.q_mat_nz = q_mat_nz
 
         self.var_partition = var_partition
 
@@ -317,13 +308,7 @@ class Cost:
         elif other.var_partition:
             mergedvar_partition = other.var_partition
 
-        # Repeated coordinates add up, so summing two costs just appends
-        # their non-zeros.  Only available when both operands carry them.
-        merged_nz = None
-        if self.q_mat_nz is not None and other.q_mat_nz is not None:
-            merged_nz = self.q_mat_nz.append(other.q_mat_nz)
-
-        return Cost(
+        merged = Cost(
             q_mat=lambda v: qm_a(v) + qm_b(v),
             q_vec=lambda v: qv_a(v) + qv_b(v),
             c    =lambda v: c_a(v)  + c_b(v),
@@ -331,8 +316,12 @@ class Cost:
             v_in_q_vec=merged_q_vec,
             v_in_c=merged_c,
             var_partition=merged_var_partition,
-            q_mat_nz=merged_nz,
         )
+        # Repeated coordinates add up, so summing two costs just appends
+        # their non-zeros.  Only available when both operands carry them.
+        if self._q_mat_nz is not None and other._q_mat_nz is not None:
+            merged._q_mat_nz = self._q_mat_nz.append(other._q_mat_nz)
+        return merged
 
     def __add__(self, other: "Cost") -> "Cost":
         """Sums two costs element-wise. See ``add`` for details."""

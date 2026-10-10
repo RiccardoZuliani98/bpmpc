@@ -34,8 +34,8 @@ class Constraint:
     lhs : Union[Array, BCOO, Callable[[ArrayIn], Union[Array, BCOO]]]
         Callable returning the left-hand side matrix of shape ``(n_cst, n_var)``, or a constant array.
         It may return (or be) a ``BCOO`` whose indices do not depend on the
-        inputs; its non-zeros are then taken from the BCOO, exactly as if
-        ``lhs_nz`` had been given.
+        inputs; the sparse assembler then writes only its stored entries
+        instead of materialising the dense ``(n_cst, n_var)`` matrix.
     rhs : Union[Array, Callable[[ArrayIn], Array]]
         Callable returning the right-hand side vector of shape ``(n_cst,)``, or a constant array.
     v_in_lhs : Optional[Dict[str, Variable]], default None
@@ -49,11 +49,6 @@ class Constraint:
         Description of each constraint using the "Partition" class.
     var_partition : Optional[Partition], default None
         Description of each variable using the "Partition" class.
-    lhs_nz : Optional[NonZeros], default None
-        Optional coordinate description of ``lhs``'s non-zeros.  When given,
-        the sparse assembler writes only these entries instead of
-        materialising the dense ``(n_cst, n_var)`` matrix.  Not allowed when
-        ``lhs`` returns a ``BCOO``.
 
     Attributes
     ----------
@@ -93,7 +88,7 @@ class Constraint:
     cst_partition:  Optional[Partition]
     var_partition:  Optional[Partition]
     name:           Optional[str]
-    lhs_nz:         Optional[NonZeros]
+    _lhs_nz:        Optional[NonZeros]
 
     def __init__(
         self,
@@ -106,7 +101,6 @@ class Constraint:
         cst_partition:  Optional[Partition] = None,
         var_partition:  Optional[Partition] = None,
         name:           Optional[str] = None,
-        lhs_nz:         Optional[NonZeros] = None,
     ) -> None:
         self.cst_type = cst_type
         self.v_in_lhs = v_in_lhs
@@ -129,17 +123,14 @@ class Constraint:
             _rhs_arr = jnp.asarray(rhs)
             self._rhs = lambda _: _rhs_arr
 
-        lhs_sample = make_sample(v_in_lhs)
-        lhs_num = self._lhs(lhs_sample)
+        # A BCOO output defines the non-zeros; ``_lhs`` stays dense.
+        lhs_num = self._lhs(make_sample(v_in_lhs))
+        self._lhs_nz = None
         if isinstance(lhs_num, BCOO):
-            self._lhs, lhs_nz, lhs_num = split_bcoo(
-                self._lhs, lhs_num, v_in_lhs, lhs_nz, "lhs")
+            self._lhs, self._lhs_nz, lhs_num = split_bcoo(
+                self._lhs, lhs_num, v_in_lhs, "lhs")
         rhs_num = self._rhs(make_sample(v_in_rhs))
         self._validate_shapes(lhs_num, rhs_num)
-
-        if lhs_nz is not None:
-            lhs_nz.check(lhs_num.shape, lhs_sample, "lhs_nz")
-        self.lhs_nz = lhs_nz
 
         self.n_cst = lhs_num.shape[0]
         self.n_var = lhs_num.shape[1]
@@ -263,7 +254,7 @@ class Constraint:
         else:
             new_slack = SlackSpec.slack_rows(self.n_cst, rows, w_quad=w_quad, w_lin=w_lin)
             
-        return Constraint(
+        slacked = Constraint(
             cst_type=self.cst_type,
             lhs=self._lhs,
             rhs=self._rhs,
@@ -273,8 +264,9 @@ class Constraint:
             var_partition=self.var_partition,
             cst_partition=self.cst_partition,
             name=self.name,
-            lhs_nz=self.lhs_nz,
         )
+        slacked._lhs_nz = self._lhs_nz
+        return slacked
 
     # ------------------------------------------------------------------
     # Algebra
@@ -360,12 +352,6 @@ class Constraint:
         lhs_a, lhs_b = self._lhs, other._lhs
         rhs_a, rhs_b = self._rhs, other._rhs
 
-        # Stacking appends the lower block's non-zeros, shifted down by this
-        # constraint's height.  Only available when both halves carry them.
-        merged_nz = None
-        if self.lhs_nz is not None and other.lhs_nz is not None:
-            merged_nz = self.lhs_nz.append(other.lhs_nz, row_shift=self.n_cst)
-
         names = set((elem for elem in [self.name, other.name] if elem is not None))
 
         if len(names) == 1: 
@@ -375,7 +361,7 @@ class Constraint:
         else:
             name = None
         
-        return Constraint(
+        merged = Constraint(
             cst_type=self.cst_type,
             lhs=lambda v: jnp.concatenate([lhs_a(v), lhs_b(v)], axis=0),
             rhs=lambda v: jnp.concatenate([rhs_a(v), rhs_b(v)], axis=0),
@@ -385,8 +371,12 @@ class Constraint:
             cst_partition=merged_cst_partition,
             var_partition=merged_var_partition,
             name=name,
-            lhs_nz=merged_nz,
         )
+        # Stacking appends the lower block's non-zeros, shifted down by this
+        # constraint's height.  Only available when both halves carry them.
+        if self._lhs_nz is not None and other._lhs_nz is not None:
+            merged._lhs_nz = self._lhs_nz.append(other._lhs_nz, row_shift=self.n_cst)
+        return merged
 
     def __add__(self, other: "Constraint") -> "Constraint":
         """Vertically stacks two constraints. See ``add`` for details."""

@@ -149,7 +149,7 @@ def decompose_costs(costs: Sequence[Cost]) -> List[_CostTerm]:
     """
     terms: List[_CostTerm] = []
     for cost in costs:
-        terms.append(_CostTerm.create("P", cost._q_mat, cost.v_in_q_mat, nz=cost.q_mat_nz))
+        terms.append(_CostTerm.create("P", cost._q_mat, cost.v_in_q_mat, nz=cost._q_mat_nz))
         terms.append(_CostTerm.create("q", cost._q_vec, cost.v_in_q_vec))
         terms.append(_CostTerm.create("c", cost._c,     cost.v_in_c))
     return terms
@@ -186,7 +186,7 @@ def decompose_constraints(
             rs = ineq_row
             ineq_row += cst.n_cst
         re = rs + cst.n_cst
-        terms.append(_CstTerm.create("lhs", kind, rs, re, cst._lhs, cst.v_in_lhs, nz=cst.lhs_nz))
+        terms.append(_CstTerm.create("lhs", kind, rs, re, cst._lhs, cst.v_in_lhs, nz=cst._lhs_nz))
         terms.append(_CstTerm.create("rhs", kind, rs, re, cst._rhs, cst.v_in_rhs))
     return terms
 

@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Literal, NamedTuple, Tuple, Union
+from typing import Callable, Dict, Literal, NamedTuple, Union
 
 import numpy as np
 import jax.numpy as jnp
@@ -122,9 +122,10 @@ class SlackData(NamedTuple):
 class NonZeros(NamedTuple):
     """Coordinate (COO) description of a matrix's structural non-zeros.
 
-    Lets the sparse assembler write a term straight into its ``BCOO`` data
-    without building the dense matrix.  Coordinates may repeat; repeated
-    entries add up.
+    Internal: derived from a cost / constraint callable that returns a
+    ``BCOO``.  Lets the assemblers write a term entry by entry without
+    building its dense matrix.  Coordinates may repeat; repeated entries
+    add up.
 
     Attributes
     ----------
@@ -148,18 +149,3 @@ class NonZeros(NamedTuple):
             cols=np.concatenate([self.cols, other.cols]),
             vals=lambda v: jnp.concatenate([va(v), vb(v)]),
         )
-
-    def check(self, shape: Tuple[int, int], v: ArrayIn, what: str) -> None:
-        """Raise if the coordinates fall outside ``shape`` or ``vals(v)``
-        does not provide exactly one value per coordinate."""
-        n = len(self.rows)
-        if len(self.cols) != n:
-            raise ValueError(f"{what}: rows and cols have different lengths.")
-        if n and (self.rows.min() < 0 or self.rows.max() >= shape[0]
-                  or self.cols.min() < 0 or self.cols.max() >= shape[1]):
-            raise ValueError(f"{what}: coordinates fall outside shape {shape}.")
-        n_vals = jnp.shape(self.vals(v))
-        if n_vals != (n,):
-            raise ValueError(
-                f"{what}: vals returned shape {n_vals}, expected ({n},)."
-            )

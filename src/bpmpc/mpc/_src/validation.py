@@ -122,7 +122,6 @@ def split_bcoo(
     fn:   Callable[[ArrayIn], BCOO],
     out:  BCOO,
     v_in: Optional[Dict[str, Variable]],
-    nz:   Optional[NonZeros],
     what: str,
 ) -> Tuple[Callable[[ArrayIn], Array], NonZeros, Array]:
     """Splits a callable returning a ``BCOO`` into a dense callable and its non-zeros.
@@ -137,21 +136,15 @@ def split_bcoo(
         fn: The user callable, returning a 2-D ``BCOO``.
         out: ``fn`` evaluated on a sample of ``v_in``.
         v_in: The variables ``fn`` depends on, or ``None`` if constant.
-        nz: Non-zeros passed alongside ``fn``; must be ``None``.
         what: Name used in error messages (e.g. ``"q_mat"``).
 
     Returns:
         The dense callable, the non-zeros, and ``out`` as a dense array.
 
     Raises:
-        ValueError: If ``nz`` is also given, if ``out`` has batch or dense
-            dimensions, or if the indices change with the inputs.
+        ValueError: If ``out`` has batch or dense dimensions, or if the
+            indices change with the inputs.
     """
-    if nz is not None:
-        raise ValueError(
-            f"{what} returns a BCOO, which already defines its non-zeros; "
-            f"do not also pass {what}_nz."
-        )
     if out.n_batch or out.n_dense:
         raise ValueError(
             f"{what} must return a BCOO without batch or dense dimensions, got "
