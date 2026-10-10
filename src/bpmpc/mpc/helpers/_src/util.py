@@ -6,14 +6,16 @@ all helper modules, as well as automatic broadcasting.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Tuple, Union
 
+import numpy as np
 import jax.numpy as jnp
 from jax import Array
 
 from bpmpc.variable import Variable
 
 ArrayOrVar = Union[Array, Variable]
+ArrayLike  = Union[Array, np.ndarray]
 
 
 def resolve(arg: ArrayOrVar, v: Dict[str, Array]) -> Array:
@@ -48,3 +50,16 @@ def auto_tile(arr: Array, expected_leading_dim: int, expected_ndim: int) -> Arra
             f"Expected {expected_ndim} or {expected_ndim - 1} dimensions, "
             f"but got an array with {arr.ndim} dimensions."
         )
+
+
+def flat_coords(*blocks: Tuple[ArrayLike, ArrayLike]) -> Tuple[np.ndarray, np.ndarray]:
+    """Flatten index blocks into 1-D COO coordinates.
+
+    Each block is a ``(rows, cols)`` pair of broadcastable index arrays, as
+    used by ``arr.at[rows, cols]``.  Blocks are flattened row-major and
+    concatenated in order, so values built as
+    ``jnp.concatenate([vals_0.ravel(), vals_1.ravel(), ...])`` line up.
+    """
+    pairs = [np.broadcast_arrays(np.asarray(r), np.asarray(c)) for r, c in blocks]
+    return (np.concatenate([r.ravel() for r, _ in pairs]),
+            np.concatenate([c.ravel() for _, c in pairs]))
