@@ -52,14 +52,15 @@ def auto_tile(arr: Array, expected_leading_dim: int, expected_ndim: int) -> Arra
         )
 
 
-def flat_coords(*blocks: Tuple[ArrayLike, ArrayLike]) -> Tuple[np.ndarray, np.ndarray]:
-    """Flatten index blocks into 1-D COO coordinates.
+def coo_indices(*blocks: Tuple[ArrayLike, ArrayLike]) -> np.ndarray:
+    """Flatten index blocks into the ``(nse, 2)`` indices of a ``BCOO``.
 
     Each block is a ``(rows, cols)`` pair of broadcastable index arrays, as
     used by ``arr.at[rows, cols]``.  Blocks are flattened row-major and
-    concatenated in order, so values built as
-    ``jnp.concatenate([vals_0.ravel(), vals_1.ravel(), ...])`` line up.
+    concatenated in order, so data built as
+    ``jnp.concatenate([vals_0.ravel(), vals_1.ravel(), ...])`` lines up.
+    The indices are NumPy constants, hence static under ``jit``.
     """
     pairs = [np.broadcast_arrays(np.asarray(r), np.asarray(c)) for r, c in blocks]
-    return (np.concatenate([r.ravel() for r, _ in pairs]),
-            np.concatenate([c.ravel() for _, c in pairs]))
+    return np.stack([np.concatenate([r.ravel() for r, _ in pairs]),
+                     np.concatenate([c.ravel() for _, c in pairs])], axis=1)

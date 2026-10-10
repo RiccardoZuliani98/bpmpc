@@ -20,6 +20,7 @@ from typing import Dict, Optional, Sequence, Tuple
 import numpy as np
 import jax.numpy as jnp
 from jax import Array
+from jax.experimental.sparse import BCOO
 
 from bpmpc.variable import Variable
 from bpmpc.mpc._src.constraint import Constraint
@@ -49,20 +50,19 @@ def _box_lhs_columns(n_x: int, n_u: int, horizon: int) -> Tuple[np.ndarray, np.n
     return cols, signs
 
 
-def _build_box_lhs_rows(
+def _box_lhs_bcoo(
     n_x: int, n_u: int, horizon: int, keep_rows: np.ndarray,
-) -> Array:
-    """Build the box LHS restricted to ``keep_rows`` of the full matrix.
+) -> BCOO:
+    """The box LHS restricted to ``keep_rows``, as a ``BCOO``.
 
-    Selecting rows up front avoids materialising the full
-    ``(2*n_z, n_z)`` matrix and then copying it through a mask.
+    Each row holds a single ``±1``.  Selecting rows up front avoids
+    materialising the full ``(2*n_z, n_z)`` matrix and then masking it.
     """
     cols, signs = _box_lhs_columns(n_x, n_u, horizon)
     n_rows = len(keep_rows)
-    out = jnp.zeros((n_rows, horizon * (n_x + n_u)))
-    return out.at[jnp.arange(n_rows), jnp.asarray(cols[keep_rows])].set(
-        jnp.asarray(signs[keep_rows])
-    )
+    indices = np.stack([np.arange(n_rows), cols[keep_rows]], axis=1)
+    return BCOO((jnp.asarray(signs[keep_rows]), indices),
+                shape=(n_rows, horizon * (n_x + n_u)))
 
 
 def build_box_lhs(n_x: int, n_u: int, horizon: int) -> Array:
@@ -76,7 +76,7 @@ def build_box_lhs(n_x: int, n_u: int, horizon: int) -> Array:
     selects inputs.
     """
     n_rows = 2 * horizon * (n_x + n_u)
-    return _build_box_lhs_rows(n_x, n_u, horizon, np.arange(n_rows))
+    return _box_lhs_bcoo(n_x, n_u, horizon, np.arange(n_rows)).todense()
 
 
 def build_box_rhs(
@@ -185,11 +185,8 @@ def box_bounds(
     # The mask is known at build time, so the kept rows can be built
     # directly instead of slicing a full (2*n_z, n_z) matrix.
     keep_rows = np.nonzero(np.asarray(mask))[0]
-    lhs_val = _build_box_lhs_rows(n_x_val, n_u_val, N, keep_rows)
+    lhs = _box_lhs_bcoo(n_x_val, n_u_val, N, keep_rows)
     keep_idx = jnp.asarray(keep_rows)
-
-    def lhs(_: Dict[str, Array]) -> Array:
-        return lhs_val
 
     def rhs(v: Dict[str, Array]) -> Array:
         return rhs_full(v)[keep_idx]

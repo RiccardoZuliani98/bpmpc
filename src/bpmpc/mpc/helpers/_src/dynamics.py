@@ -24,9 +24,12 @@ from typing import Dict, Optional, Sequence
 import jax
 import jax.numpy as jnp
 from jax import Array
+from jax.experimental.sparse import BCOO
+
+import numpy as np
 
 from bpmpc.mpc._src.constraint import Constraint
-from bpmpc.mpc.helpers._src.util import ArrayOrVar, resolve, collect_v_in, auto_tile
+from bpmpc.mpc.helpers._src.util import ArrayOrVar, resolve, collect_v_in, auto_tile, coo_indices
 from bpmpc.dynamics import Dynamics
 from bpmpc.mpc._src.partition import Partition
 
@@ -42,10 +45,31 @@ def _block_indices(N: int, n_x: int, n_u: int):
     ``rows[k]`` are the global rows of dynamics block ``k``, ``cols_x[k]``
     the columns of state ``x_{k+1}`` and ``cols_u[k]`` those of ``u_k``.
     """
-    ks = jnp.arange(N)[:, None]
-    rows = ks * n_x + jnp.arange(n_x)[None, :]
-    cols_u = N * n_x + ks * n_u + jnp.arange(n_u)[None, :]
+    ks = np.arange(N)[:, None]
+    rows = ks * n_x + np.arange(n_x)[None, :]
+    cols_u = N * n_x + ks * n_u + np.arange(n_u)[None, :]
     return rows, rows, cols_u
+
+
+def _ltv_lhs_bcoo(A: Array, B: Array, horizon: int) -> BCOO:
+    """The dynamics LHS as a ``BCOO`` with static indices.
+
+    ``A`` is ``(N, n_x, n_x)`` and ``B`` is ``(N, n_x, n_u)``.  The stored
+    entries are, in order, the ``-I`` block diagonal (state ``k+1``), the
+    ``A`` sub-diagonal (state ``k``) and the ``B`` input diagonal.
+    """
+    N = horizon
+    n_x, n_u = A.shape[1], B.shape[2]
+    rows, cols_x, cols_u = _block_indices(N, n_x, n_u)
+    indices = coo_indices(
+        (rows, cols_x),
+        (rows[1:, :, None], cols_x[:-1, None, :]),
+        (rows[:, :, None], cols_u[:, None, :]),
+    )
+    data = jnp.concatenate([
+        -jnp.ones(N * n_x, dtype=_lhs_dtype(A, B)), A[1:].ravel(), B.ravel(),
+    ])
+    return BCOO((data, indices), shape=(N * n_x, N * n_x + N * n_u))
 
 
 def _lhs_dtype(*arrs: Array) -> jnp.dtype:
@@ -73,24 +97,14 @@ def build_lti_lhs(A: Array, B: Array, horizon: int) -> Array:
         F_u = kron(I_N, B)
         F   = [F_x | F_u]
 
-    where ``S`` is the sub-diagonal shift matrix.  The blocks are
-    scattered straight into a single allocation — building them via
-    ``kron`` and concatenating costs several dense temporaries.
+    where ``S`` is the sub-diagonal shift matrix.  Only the non-zero
+    blocks are formed (see :func:`_ltv_lhs_bcoo`), then densified.
     """
     n_x, n_u = A.shape[0], B.shape[1]
     N = horizon
-    rows, cols_x, cols_u = _block_indices(N, n_x, n_u)
-
-    F = jnp.zeros((N * n_x, N * n_x + N * n_u), dtype=_lhs_dtype(A, B))
-    # -I on the block diagonal (state k+1), A on the sub-diagonal (state k)
-    F = F.at[rows, cols_x].set(-1.0)
-    F = F.at[rows[1:, :, None], cols_x[:-1, None, :]].set(
-        jnp.broadcast_to(A, (N - 1, n_x, n_x))
-    )
-    # B on the block diagonal of the input columns
-    return F.at[rows[:, :, None], cols_u[:, None, :]].set(
-        jnp.broadcast_to(B, (N, n_x, n_u))
-    )
+    return _ltv_lhs_bcoo(
+        jnp.broadcast_to(A, (N, n_x, n_x)), jnp.broadcast_to(B, (N, n_x, n_u)), N,
+    ).todense()
 
 
 def build_lti_rhs(
@@ -129,17 +143,7 @@ def build_ltv_lhs(A: Array, B: Array, horizon: int) -> Array:
     -------
     ``(N*n_x, N*n_x + N*n_u)`` dense constraint matrix.
     """
-    N = horizon
-    n_x = A.shape[1]
-    n_u = B.shape[2]
-    rows, cols_x, cols_u = _block_indices(N, n_x, n_u)
-
-    # One allocation for [F_x | F_u]; the old version built both halves
-    # separately (plus a ``kron`` for the identity) and concatenated them.
-    F = jnp.zeros((N * n_x, N * n_x + N * n_u), dtype=_lhs_dtype(A, B))
-    F = F.at[rows, cols_x].set(-1.0)
-    F = F.at[rows[1:, :, None], cols_x[:-1, None, :]].set(A[1:])
-    return F.at[rows[:, :, None], cols_u[:, None, :]].set(B)
+    return _ltv_lhs_bcoo(A, B, horizon).todense()
 
 
 def build_ltv_rhs(
@@ -214,8 +218,8 @@ def lti_dynamics(
     nx = int(A.shape[-1])
     nu = int(B.shape[-1])
 
-    def lhs(v: Dict[str, Array]) -> Array:
-        return build_lti_lhs(resolve(A, v), resolve(B, v), N)
+    def lhs(v: Dict[str, Array]) -> BCOO:
+        return _ltv_lhs_bcoo(auto_tile(resolve(A, v), N, 3), auto_tile(resolve(B, v), N, 3), N)
 
     def rhs(v: Dict[str, Array]) -> Array:
         c_val = resolve(c, v) if c is not None else None
@@ -287,9 +291,9 @@ def ltv_dynamics(
     nx = int(A.shape[-1])
     nu = int(B.shape[-1])
 
-    def lhs(v: Dict[str, Array]) -> Array:
+    def lhs(v: Dict[str, Array]) -> BCOO:
         # A and B are sequence of matrices -> expected ndim = 3
-        return build_ltv_lhs(auto_tile(resolve(A, v), N, 3), auto_tile(resolve(B, v), N, 3), N)
+        return _ltv_lhs_bcoo(auto_tile(resolve(A, v), N, 3), auto_tile(resolve(B, v), N, 3), N)
 
     def rhs(v: Dict[str, Array]) -> Array:
         # c is a sequence of vectors -> expected ndim = 2
@@ -379,14 +383,14 @@ def nonlinear_dynamics(
     # Vectorize across the trajectory horizon
     linearize_traj = jax.vmap(linearize_step, in_axes=(0, 0, None))
 
-    def lhs(v: Dict[str, Array]) -> Array:
+    def lhs(v: Dict[str, Array]) -> BCOO:
         # x_nominal and u_nominal are trajectories -> expected ndim = 2
         x_nom = auto_tile(resolve(x_nominal, v), N, 2)
         u_nom = auto_tile(resolve(u_nominal, v), N, 2)
         params = {k: resolve(p, v) for k, p in (true_params or {}).items()}
         
         A_traj, B_traj, _ = linearize_traj(x_nom, u_nom, params)
-        return build_ltv_lhs(A_traj, B_traj, N)
+        return _ltv_lhs_bcoo(A_traj, B_traj, N)
 
     def rhs(v: Dict[str, Array]) -> Array:
         x_nom = auto_tile(resolve(x_nominal, v), N, 2)

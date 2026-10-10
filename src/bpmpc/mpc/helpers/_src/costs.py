@@ -20,11 +20,13 @@ from __future__ import annotations
 
 from typing import Dict, Optional, Tuple, Sequence
 
+import numpy as np
 import jax.numpy as jnp
 from jax import Array
+from jax.experimental.sparse import BCOO
 
 from bpmpc.mpc._src.cost import Cost
-from bpmpc.mpc.helpers._src.util import ArrayOrVar, resolve, collect_v_in, auto_tile
+from bpmpc.mpc.helpers._src.util import ArrayOrVar, resolve, collect_v_in, auto_tile, coo_indices
 from bpmpc.mpc._src.partition import Partition
 
 
@@ -32,7 +34,7 @@ from bpmpc.mpc._src.partition import Partition
 # State tracking builder
 # ======================================================================
 
-def _decision_indices(n_x: int, n_u: int, horizon: int) -> Tuple[Array, Array, int]:
+def _decision_indices(n_x: int, n_u: int, horizon: int) -> Tuple[np.ndarray, np.ndarray, int]:
     """Index grids of the per-step state and input blocks of ``z``.
 
     Returns ``(x_idx, u_idx, n_z)`` where ``x_idx[t]`` holds the decision
@@ -40,9 +42,9 @@ def _decision_indices(n_x: int, n_u: int, horizon: int) -> Tuple[Array, Array, i
     """
     N = horizon
     n_x_total = N * n_x
-    ks = jnp.arange(N)[:, None]
-    x_idx = ks * n_x + jnp.arange(n_x)[None, :]
-    u_idx = n_x_total + ks * n_u + jnp.arange(n_u)[None, :]
+    ks = np.arange(N)[:, None]
+    x_idx = ks * n_x + np.arange(n_x)[None, :]
+    u_idx = n_x_total + ks * n_u + np.arange(n_u)[None, :]
     return x_idx, u_idx, n_x_total + N * n_u
 
 
@@ -52,14 +54,23 @@ def build_state_tracking_mat(Q: Array, R: Array, horizon: int) -> Array:
     See :func:`build_state_tracking`.  Split out so callers that need the
     quadratic term alone do not trace the reference-dependent work.
     """
-    x_idx, u_idx, n_z = _decision_indices(Q.shape[1], R.shape[1], horizon)
+    return _state_tracking_mat_bcoo(Q, R, horizon).todense()
 
-    # Block-diagonal, written with one batched scatter per block family.
-    # A Python loop over the horizon emits N full-(n_z, n_z) scatters,
-    # which makes trace and compile time grow with N.
-    P = jnp.zeros((n_z, n_z))
-    P = P.at[x_idx[:, :, None], x_idx[:, None, :]].set(2.0 * Q[1:])
-    return P.at[u_idx[:, :, None], u_idx[:, None, :]].set(2.0 * R)
+
+def _state_tracking_mat_bcoo(Q: Array, R: Array, horizon: int) -> BCOO:
+    """The state-tracking ``P`` as a ``BCOO`` with static indices.
+
+    Block-diagonal: the per-step state blocks, then the per-step input
+    blocks.  Each family is one batch of entries, so trace and compile
+    time do not grow with a Python loop over the horizon.
+    """
+    x_idx, u_idx, n_z = _decision_indices(Q.shape[1], R.shape[1], horizon)
+    indices = coo_indices(
+        (x_idx[:, :, None], x_idx[:, None, :]),
+        (u_idx[:, :, None], u_idx[:, None, :]),
+    )
+    data = 2.0 * jnp.concatenate([Q[1:].ravel(), R.ravel()])
+    return BCOO((data, indices), shape=(n_z, n_z))
 
 
 def build_state_tracking_vec(
@@ -157,10 +168,17 @@ def build_output_tracking_mat(
     four families of non-zero blocks are contracted directly, which is
     ``O(N)``.  See :func:`build_output_tracking`.
     """
+    return _output_tracking_mat_bcoo(C, D, Q, horizon).todense()
+
+
+def _output_tracking_mat_bcoo(C: Array, D: Array, Q: Array, horizon: int) -> BCOO:
+    """The output-tracking ``P`` as a ``BCOO`` with static indices.
+
+    Stores the four non-zero block families: state diagonal, input
+    diagonal and the two state/input cross blocks.
+    """
     N = horizon
-    n_x = C.shape[2]
-    n_u = D.shape[2]
-    x_idx, u_idx, n_z = _decision_indices(n_x, n_u, N)
+    x_idx, u_idx, n_z = _decision_indices(C.shape[2], D.shape[2], N)
 
     C_dec = C[1:]                                        # C_t for t = 1..N
     QC = jnp.einsum("tij,tjk->tik", Q[1:], C_dec)        # Q_t C_t,  t = 1..N
@@ -177,11 +195,14 @@ def build_output_tracking_mat(
     Pxu = jnp.einsum("tpi,tpk->tik", C_dec[:-1], QxD)
     Pux = jnp.einsum("tpk,tpi->tki", D[1:], QC[:-1])
 
-    P = jnp.zeros((n_z, n_z))
-    P = P.at[x_idx[:, :, None], x_idx[:, None, :]].add(2.0 * Pxx)
-    P = P.at[u_idx[:, :, None], u_idx[:, None, :]].add(2.0 * Puu)
-    P = P.at[x_idx[:-1, :, None], u_idx[1:, None, :]].add(2.0 * Pxu)
-    return P.at[u_idx[1:, :, None], x_idx[:-1, None, :]].add(2.0 * Pux)
+    indices = coo_indices(
+        (x_idx[:, :, None], x_idx[:, None, :]),
+        (u_idx[:, :, None], u_idx[:, None, :]),
+        (x_idx[:-1, :, None], u_idx[1:, None, :]),
+        (u_idx[1:, :, None], x_idx[:-1, None, :]),
+    )
+    data = 2.0 * jnp.concatenate([Pxx.ravel(), Puu.ravel(), Pxu.ravel(), Pux.ravel()])
+    return BCOO((data, indices), shape=(n_z, n_z))
 
 
 def build_output_tracking_vec(
@@ -301,10 +322,10 @@ def state_tracking_cost(
     nx = int(Q.shape[-1])
     nu = int(R.shape[-1])
 
-    def _get_P(v: Dict[str, Array]) -> Array:
+    def _get_P(v: Dict[str, Array]) -> BCOO:
         Q_val = auto_tile(resolve(Q, v), N + 1, 3)
         R_val = auto_tile(resolve(R, v), N, 3)
-        return build_state_tracking_mat(Q_val, R_val, N)
+        return _state_tracking_mat_bcoo(Q_val, R_val, N)
 
     def _get_q(v: Dict[str, Array]) -> Array:
         Q_val = auto_tile(resolve(Q, v), N + 1, 3)
@@ -384,11 +405,11 @@ def output_tracking_cost(
     nx = int(C.shape[-1])
     nu = int(D.shape[-1])
 
-    def _get_P(v: Dict[str, Array]) -> Array:
+    def _get_P(v: Dict[str, Array]) -> BCOO:
         C_val = auto_tile(resolve(C, v), N + 1, 3)
         D_val = auto_tile(resolve(D, v), N, 3)
         Q_val = auto_tile(resolve(Q, v), N + 1, 3)
-        return build_output_tracking_mat(C_val, D_val, Q_val, N)
+        return _output_tracking_mat_bcoo(C_val, D_val, Q_val, N)
 
     def _get_q(v: Dict[str, Array]) -> Array:
         C_val = auto_tile(resolve(C, v), N + 1, 3)
