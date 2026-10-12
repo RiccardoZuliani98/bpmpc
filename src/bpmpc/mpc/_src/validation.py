@@ -7,7 +7,7 @@ return a ``BCOO`` into a dense callable plus its :class:`NonZeros`.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple, cast
 
 import numpy as np
 import jax.numpy as jnp
@@ -15,7 +15,7 @@ from jax import Array
 from jax.experimental.sparse import BCOO
 
 from bpmpc.variable import Variable
-from bpmpc.mpc._src.types import ArrayIn, NonZeros
+from bpmpc.mpc._src.types import ArrayIn, NonZeros, QArray
 
 
 # ======================================================================
@@ -119,7 +119,7 @@ def make_sample(v_in: Optional[Dict[str, Variable]]) -> ArrayIn:
 # ======================================================================
 
 def split_bcoo(
-    fn:   Callable[[ArrayIn], BCOO],
+    fn:   Callable[[ArrayIn], QArray],
     out:  BCOO,
     v_in: Optional[Dict[str, Variable]],
     what: str,
@@ -162,12 +162,16 @@ def split_bcoo(
                 f"arrays), not from the input values."
             )
 
+    # ``out`` (and, if parametric, the samples above) are BCOOs, so ``fn``
+    # returns one.
+    bcoo_fn = cast(Callable[[ArrayIn], BCOO], fn)
+
     rows, cols = idx[:, 0], idx[:, 1]
     keep = (rows < out.shape[0]) & (cols < out.shape[1])
     if keep.all():
-        vals = lambda v: fn(v).data
+        vals = lambda v: bcoo_fn(v).data
     else:
         rows, cols = rows[keep], cols[keep]
-        vals = lambda v: fn(v).data[keep]
+        vals = lambda v: bcoo_fn(v).data[keep]
 
-    return (lambda v: fn(v).todense()), NonZeros(rows, cols, vals), out.todense()
+    return (lambda v: bcoo_fn(v).todense()), NonZeros(rows, cols, vals), out.todense()

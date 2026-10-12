@@ -11,7 +11,7 @@ empty dict ``{}`` so the calling convention is uniform.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Literal, Optional, Sequence, Union
+from typing import Callable, Dict, Literal, Optional, Sequence, Union, cast
 
 import jax.numpy as jnp
 from jax import Array
@@ -19,7 +19,7 @@ from jax.experimental.sparse import BCOO
 
 from bpmpc.variable             import Variable
 from bpmpc.mpc._src.slack       import SlackSpec
-from bpmpc.mpc._src.types       import ArrayIn, NonZeros
+from bpmpc.mpc._src.types       import ArrayIn, NonZeros, QArray
 from bpmpc.mpc._src.validation  import validate_shared_variables, make_sample, merge_v_in, split_bcoo
 from bpmpc.mpc._src.partition   import Partition
 
@@ -88,12 +88,14 @@ class Constraint:
     cst_partition:  Optional[Partition]
     var_partition:  Optional[Partition]
     name:           Optional[str]
+    _lhs:           Callable[[ArrayIn], Array]
+    _rhs:           Callable[[ArrayIn], Array]
     _lhs_nz:        Optional[NonZeros]
 
     def __init__(
         self,
         cst_type:       Literal["equality", "inequality"],
-        lhs:            Union[Array, Callable[[ArrayIn], Array]],
+        lhs:            Union[QArray, Callable[[ArrayIn], QArray]],
         rhs:            Union[Array, Callable[[ArrayIn], Array]],
         v_in_lhs:       Optional[Dict[str, Variable]] = None,
         v_in_rhs:       Optional[Dict[str, Variable]] = None,
@@ -109,13 +111,14 @@ class Constraint:
         if v_in_lhs is not None and v_in_rhs is not None:
             validate_shared_variables(v_in_lhs, v_in_rhs, "lhs", "rhs")
 
+        _lhs_fn: Callable[[ArrayIn], QArray]
         if isinstance(lhs, BCOO):
-            self._lhs = lambda _: lhs
+            _lhs_fn = lambda _: lhs
         elif callable(lhs):
-            self._lhs = lhs
+            _lhs_fn = lhs
         else:
             _lhs_arr = jnp.asarray(lhs)
-            self._lhs = lambda _: _lhs_arr
+            _lhs_fn = lambda _: _lhs_arr
             
         if callable(rhs):
             self._rhs = rhs
@@ -124,11 +127,14 @@ class Constraint:
             self._rhs = lambda _: _rhs_arr
 
         # A BCOO output defines the non-zeros; ``_lhs`` stays dense.
-        lhs_num = self._lhs(make_sample(v_in_lhs))
+        lhs_num = _lhs_fn(make_sample(v_in_lhs))
         self._lhs_nz = None
         if isinstance(lhs_num, BCOO):
             self._lhs, self._lhs_nz, lhs_num = split_bcoo(
-                self._lhs, lhs_num, v_in_lhs, "lhs")
+                _lhs_fn, lhs_num, v_in_lhs, "lhs")
+        else:
+            # The sample is dense, so the callable returns dense arrays.
+            self._lhs = cast(Callable[[ArrayIn], Array], _lhs_fn)
         rhs_num = self._rhs(make_sample(v_in_rhs))
         self._validate_shapes(lhs_num, rhs_num)
 

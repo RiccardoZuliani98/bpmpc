@@ -11,14 +11,14 @@ Each of the three terms can depend on a different set of variables.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Optional, Union
+from typing import Callable, Dict, Optional, Union, cast
 
 import jax.numpy as jnp
 from jax import Array
 from jax.experimental.sparse import BCOO
 
 from bpmpc.variable             import Variable
-from bpmpc.mpc._src.types       import ArrayIn, NonZeros
+from bpmpc.mpc._src.types       import ArrayIn, NonZeros, QArray
 from bpmpc.mpc._src.validation  import validate_shared_variables, make_sample, merge_v_in, split_bcoo
 from bpmpc.mpc._src.partition   import Partition
 
@@ -72,11 +72,12 @@ class Cost:
     v_in_c:         Optional[Dict[str, Variable]]
     n_var:          int
     var_partition:  Optional[Partition]
+    _q_mat:         Callable[[ArrayIn], Array]
     _q_mat_nz:      Optional[NonZeros]
 
     def __init__(
         self,
-        q_mat:          Union[Array, Callable[[ArrayIn], Array]],
+        q_mat:          Union[QArray, Callable[[ArrayIn], QArray]],
         q_vec:          Optional[Union[Array, Callable[[ArrayIn], Array]]] = None,
         c:              Optional[Union[Array, float, Callable[[ArrayIn], Array]]] = None,
         v_in_q_mat:     Optional[Dict[str, Variable]] = None,
@@ -99,6 +100,7 @@ class Cost:
         # --------------------------------------------------------------
         # Normalize and Probe q_mat
         # --------------------------------------------------------------
+        _q_mat_fn: Callable[[ArrayIn], QArray]
         if isinstance(q_mat, BCOO):
             _q_mat_fn = lambda _: q_mat
         elif callable(q_mat):
@@ -111,8 +113,11 @@ class Cost:
         q_mat_num = _q_mat_fn(make_sample(v_in_q_mat))
         self._q_mat_nz = None
         if isinstance(q_mat_num, BCOO):
-            _q_mat_fn, self._q_mat_nz, q_mat_num = split_bcoo(
+            self._q_mat, self._q_mat_nz, q_mat_num = split_bcoo(
                 _q_mat_fn, q_mat_num, v_in_q_mat, "q_mat")
+        else:
+            # The sample is dense, so the callable returns dense arrays.
+            self._q_mat = cast(Callable[[ArrayIn], Array], _q_mat_fn)
         if q_mat_num.ndim != 2:
             raise ValueError(
                 f"q_mat must return a 2-D array, got ndim={q_mat_num.ndim}, "
@@ -123,7 +128,6 @@ class Cost:
             raise ValueError(f"q_mat must be square, got shape ({n_row}, {n_col}).")
         
         self.n_var = n_row
-        self._q_mat = _q_mat_fn
 
         self.var_partition = var_partition
 
