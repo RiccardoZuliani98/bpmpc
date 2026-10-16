@@ -340,6 +340,7 @@ def nonlinear_dynamics(
     u_nominal   : ArrayOrVar, 
     horizon     : int,
     true_params : Optional[Dict[str, ArrayOrVar]] = None,
+    x0          : Optional[ArrayOrVar] = None,
     state_names : Optional[Sequence[str]] = None,
     input_names : Optional[Sequence[str]] = None,
     cst_name    : str = "dyn"
@@ -362,6 +363,9 @@ def nonlinear_dynamics(
     horizon : N (≥ 1).
     true_params : Optional[Dict[str, ArrayOrVar]]
         Parameters passed to the `dyn.step` method.
+    x0 : Optional ``(n_x,)`` ArrayOrVar
+        Initial state. Defaults to the first state of `x_nominal`. Only the RHS
+        depends on it, so the LHS stays independent of `x0`.
     state_names : Optional[Sequence[str]], default None
         Name of each state, used to construct partitions.
     input_names : Optional[Sequence[str]], default None
@@ -408,16 +412,18 @@ def nonlinear_dynamics(
         params = {k: resolve(p, v) for k, p in (true_params or {}).items()}
         
         A_traj, _, c_traj = linearize_traj(x_nom, u_nom, params)
-        return build_ltv_rhs(A_traj, x_nom[0], N, c_traj)
+        x0_val = x_nom[0] if x0 is None else resolve(x0, v)
+        return build_ltv_rhs(A_traj, x0_val, N, c_traj)
 
     all_vars = collect_v_in(x_nominal=x_nominal, u_nominal=u_nominal, **(true_params or {}))
+    rhs_vars = collect_v_in(x_nominal=x_nominal, u_nominal=u_nominal, x0=x0, **(true_params or {}))
     
     return Constraint(
         cst_type="equality",
         lhs=lhs,
         rhs=rhs,
         v_in_lhs=all_vars,
-        v_in_rhs=all_vars,
+        v_in_rhs=rhs_vars,
         var_partition=Partition.state_before_input(
             nx, nu, N,
             state_names=state_names,
