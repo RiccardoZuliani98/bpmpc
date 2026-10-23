@@ -356,8 +356,9 @@ def nonlinear_dynamics(
     ----------
     dyn : Dynamics
         The nonlinear dynamics model to linearize.
-    x_nominal : ``(N, n_x)`` ArrayOrVar
-        The state trajectory to linearize around.
+    x_nominal : ``(N, n_x)`` or ``(N+1, n_x)`` ArrayOrVar
+        The state trajectory to linearize around. When N+1 states are given
+        (e.g. the reference used by `build_state_tracking`), the last one is ignored.
     u_nominal : ``(N, n_u)`` ArrayOrVar
         The input trajectory to linearize around.
     horizon : N (≥ 1).
@@ -384,6 +385,12 @@ def nonlinear_dynamics(
     nx = int(x_nominal.shape[-1])
     nu = int(u_nominal.shape[-1])
 
+    # A trajectory may carry the terminal state too: it is not linearized, so drop it
+    x_shape = tuple(x_nominal.shape)
+    if len(x_shape) == 2 and x_shape[0] not in (N, N + 1):
+        raise ValueError(f"x_nominal must have N={N} or N+1={N + 1} states, got shape {x_shape}")
+    trim_x = len(x_shape) == 2 and x_shape[0] == N + 1
+
     def linearize_step(x, u, params):
         # A_t = df/dx, B_t = df/du
         A_t = jax.jacfwd(dyn.step, argnums=0)(x, u, params, params)
@@ -399,7 +406,8 @@ def nonlinear_dynamics(
 
     def lhs(v: Dict[str, Array]) -> BCOO:
         # x_nominal and u_nominal are trajectories -> expected ndim = 2
-        x_nom = auto_tile(resolve(x_nominal, v), N, 2)
+        x_nom = resolve(x_nominal, v)
+        x_nom = auto_tile(x_nom[:N] if trim_x else x_nom, N, 2)
         u_nom = auto_tile(resolve(u_nominal, v), N, 2)
         params = {k: resolve(p, v) for k, p in (true_params or {}).items()}
         
@@ -407,7 +415,8 @@ def nonlinear_dynamics(
         return _ltv_lhs_bcoo(A_traj, B_traj, N)
 
     def rhs(v: Dict[str, Array]) -> Array:
-        x_nom = auto_tile(resolve(x_nominal, v), N, 2)
+        x_nom = resolve(x_nominal, v)
+        x_nom = auto_tile(x_nom[:N] if trim_x else x_nom, N, 2)
         u_nom = auto_tile(resolve(u_nominal, v), N, 2)
         params = {k: resolve(p, v) for k, p in (true_params or {}).items()}
         

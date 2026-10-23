@@ -244,6 +244,47 @@ class TestNonlinearDynamics:
         assert jnp.allclose(lhs_nl, lhs_ltv, atol=1e-5)
         assert jnp.allclose(rhs_nl, rhs_ltv, atol=1e-5)
 
+    def test_separate_x0_matches_ltv(self):
+        """Verify that a separate x0 enters the RHS only, as in the LTV formulation."""
+        key = jax.random.PRNGKey(42)
+        X_traj = jax.random.normal(key, (N, NX))
+        U_traj = jax.random.normal(key, (N, NU))
+        v_x0 = Variable("x0", (NX,))
+
+        def lin_step(x, u):
+            A = jax.jacfwd(self.nl_step, 0)(x, u, {})
+            B = jax.jacfwd(self.nl_step, 1)(x, u, {})
+            c = self.nl_step(x, u, {}) - A @ x - B @ u
+            return A, B, c
+
+        A_traj, B_traj, c_traj = jax.vmap(lin_step)(X_traj, U_traj)
+
+        cst_ltv = ltv_dynamics(A_traj, B_traj, X0_VAL, horizon=N, c=c_traj)
+        cst_nl = nonlinear_dynamics(self.dyn, X_traj, U_traj, horizon=N, x0=v_x0)
+
+        assert not cst_nl.is_parametric_lhs
+        assert "x0" in cst_nl.v_in_rhs
+
+        assert jnp.allclose(cst_nl.eval_lhs({}), cst_ltv.eval_lhs({}), atol=1e-5)
+        assert jnp.allclose(cst_nl.eval_rhs({"x0": X0_VAL}), cst_ltv.eval_rhs({}), atol=1e-5)
+
+    def test_terminal_state_ignored(self):
+        """Verify that an (N+1, n_x) nominal matches one built from its first N states."""
+        key = jax.random.PRNGKey(42)
+        X_traj = jax.random.normal(key, (N + 1, NX))
+        U_traj = jax.random.normal(key, (N, NU))
+        v_x0 = Variable("x0", (NX,))
+
+        for x0, v in ((None, {}), (v_x0, {"x0": X0_VAL})):
+            cst_full = nonlinear_dynamics(self.dyn, X_traj, U_traj, horizon=N, x0=x0)
+            cst_trim = nonlinear_dynamics(self.dyn, X_traj[:N], U_traj, horizon=N, x0=x0)
+
+            assert jnp.allclose(cst_full.eval_lhs(v), cst_trim.eval_lhs(v), atol=1e-5)
+            assert jnp.allclose(cst_full.eval_rhs(v), cst_trim.eval_rhs(v), atol=1e-5)
+
+        with pytest.raises(ValueError):
+            nonlinear_dynamics(self.dyn, Variable("x_nom", (N + 2, NX)), U_traj, horizon=N)
+
     def test_trajectory_satisfaction(self):
         """Verify that simulating the nonlinear system exactly satisfies its linearized constraints."""
         U = jnp.ones((N, NU))
